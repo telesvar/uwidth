@@ -1,1034 +1,1086 @@
 #!/usr/bin/env python3
 #
-# Generate C code for unicode-width calculations for terminal applications.
-# Left-to-right processing; useful subset for terminals (EAW, emoji, combining,
-# control chars). All Unicode files are fetched from .../<version>/ucd/<path>.
-#
-# Copyright 2011-2025 The Rust Project Developers.
-# Copyright 2025 Dair Aidarkhanov.
-#
-# Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
-# http://www.apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT
-# or http://opensource.org/licenses/MIT>, at your option. The generated C
-# code is licensed under the 0BSD.
-#
-# Unicode® data: https://www.unicode.org/license.txt
+# Copyright 2025-2026 Dair Aidarkhanov
+# SPDX-License-Identifier: Zlib
 
-import enum
-import math
-import operator
+"""Build uwidth.c from Unicode data and uwidth.c.in."""
+
+import argparse
+import hashlib
 import os
-import re
-import sys
+import tempfile
 import urllib.request
-from collections import defaultdict
-from typing import Callable, Iterable, Dict, List, Tuple
-
-UNICODE_VERSION = "16.0.0"
-NUM_CODEPOINTS = 0x110000
-MAX_CODEPOINT_BITS = math.ceil(math.log2(NUM_CODEPOINTS - 1))
-TABLE_SPLITS = [7, 13]  # leaves: [0..7), middle: [7..13), root: [13..]
-OUTPUT_HEADER = "unicode_width.h"
-OUTPUT_SOURCE = "unicode_width.c"
+from array import array
+from pathlib import Path
 
 
-class OffsetType(enum.IntEnum):
-    U2 = 2
-    U4 = 4
-    U8 = 8
+# Configuration
+
+project_root = Path(__file__).resolve().parent
+template_path = project_root / "uwidth.c.in"
+output_path = project_root / "uwidth.c"
+header_path = project_root / "uwidth.h"
+# Unicode version and beta flag come from uwidth.h so the C API and the tables
+# always describe the same release.
+header_defines = {
+    fields[1]: fields[2]
+    for line in header_path.read_text(encoding="utf-8").splitlines()
+    if len(fields := line.split()) == 3 and fields[0] == "#define"
+}
+unicode_version = ".".join(
+    header_defines[name]
+    for name in (
+        "UWIDTH_UNICODE_VERSION_MAJOR",
+        "UWIDTH_UNICODE_VERSION_MINOR",
+        "UWIDTH_UNICODE_VERSION_PATCH",
+    )
+)
+unicode_is_beta = header_defines["UWIDTH_UNICODE_VERSION_IS_BETA"] == "1"
+# Beta builds pull from Public/draft/. Final builds use Public/<version>/.
+unicode_public_directory = "draft" if unicode_is_beta else unicode_version
+unicode_data_label = unicode_version + (" beta" if unicode_is_beta else "")
+unicode_data_name = unicode_data_label.replace(" ", "-")
+unicode_limit = 0x110000
+
+property_run_block = 16
+property_page_shift = 12
+property_dictionary_index_bits = 5
+property_dictionary_index_mask = (1 << property_dictionary_index_bits) - 1
+
+encoded_u16_bytes = 2
+encoded_u21_bytes = 3
+checkpoint_bytes = encoded_u21_bytes + encoded_u16_bytes
+
+dfa_root_block = 16
+dfa_offset_bits = 14
+dfa_action_shift = dfa_offset_bits
+dfa_offset_limit = 1 << dfa_offset_bits
+dfa_offset_mask = dfa_offset_limit - 1
+dfa_dead = 0xFF
+
+unicode_sources = {
+    "DerivedCoreProperties.txt": (
+        "ucd/DerivedCoreProperties.txt",
+        "09c928886a178fcafd93c29e4bd59073a058e5a100b716d425cb563ab50f68c9",
+    ),
+    "DerivedEastAsianWidth.txt": (
+        "ucd/extracted/DerivedEastAsianWidth.txt",
+        "f4c7bc4537a71e12452f6347ecbbc71c31cba21b5190c92be1ae296b0ef32b09",
+    ),
+    "GraphemeBreakProperty.txt": (
+        "ucd/auxiliary/GraphemeBreakProperty.txt",
+        "0839dcb79e4ac639ecd538b1abf7c9d22e3f9dd265b7e182d33627aa4d75b45a",
+    ),
+    "UnicodeData.txt": (
+        "ucd/UnicodeData.txt",
+        "0736451de439ae7baf1425136617da495e09ee5afbe6e394374db7009ea08950",
+    ),
+    "emoji-data.txt": (
+        "ucd/emoji/emoji-data.txt",
+        "80d00f8e616a0ef27fd6b8de3b758c06383b5d917e2977709578e68baf733bf1",
+    ),
+    "emoji-test.txt": (
+        "emoji/emoji-test.txt",
+        "8f3735cda1f92a779d78af67cf86066bb1f07143dc22f2ac29394d9bc57ab21a",
+    ),
+    "emoji-variation-sequences.txt": (
+        "ucd/emoji/emoji-variation-sequences.txt",
+        "ff1707564aa1f1b2fcf4ec92d609d4cb26940bc0d4dcf07f5328ad6879e84da3",
+    ),
+}
+# Cache directory includes a short hash of the pinned file digests so a hash
+# bump fetches into a new folder instead of reusing stale files.
+unicode_data_revision = hashlib.sha256(
+    "".join(
+        unicode_sources[name][1] for name in sorted(unicode_sources)
+    ).encode()
+).hexdigest()[:12]
+unicode_data_directory = (
+    project_root / ".unicode-data" / f"{unicode_data_name}-{unicode_data_revision}"
+)
+
+# Encoded property values
+
+grapheme_break_mask = 0x0F
+extended_pictographic_bit = 0x10
+indic_conjunct_break_shift = 5
+indic_conjunct_break_mask = 0x03
+contribution_shift = 7
+contribution_mask = 0x03
+dfa_start_bit = 0x0200
+ascii_limit = 0x80
+ascii_printable_first = 0x20
+ascii_printable_last = 0x7E
+cr_code_point = 0x0D
+lf_code_point = 0x0A
+
+grapheme_break_values = {
+    "Other": 0,
+    "CR": 1,
+    "LF": 2,
+    "Control": 3,
+    "Extend": 4,
+    "ZWJ": 5,
+    "Regional_Indicator": 6,
+    "Prepend": 7,
+    "SpacingMark": 8,
+    "L": 9,
+    "V": 10,
+    "T": 11,
+    "LV": 12,
+    "LVT": 13,
+}
+cc_grapheme_break = 14
+
+indic_conjunct_break_values = {
+    "None": 0,
+    "Extend": 1,
+    "Linker": 2,
+    "Consonant": 3,
+}
+
+width_none = 0
+width_narrow = 1
+width_ambiguous = 2
+width_wide = 3
+
+action_none = 0
+action_emoji = 1
+action_text = 2
+
+emoji_stage_none = 0
+emoji_stage_extended_pictographic = 1
+emoji_stage_zwj = 2
+emoji_stage_mask = 0x03
 
 
-Codepoint = int
-BitPos = int
+# Unicode data
+
+def sha256_digest(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
-def fetch_open(path_rel_ucd: str, local_prefix: str = ""):
-    """Fetch file from Public/<version>/ucd/<path_rel_ucd> into local cache."""
-    basename = os.path.basename(path_rel_ucd)
-    localname = os.path.join(local_prefix, basename)
-    if not os.path.exists(localname):
-        try:
-            if not hasattr(fetch_open, "_notice"):
-                print("\nDownloading Unicode data files from unicode.org...")
-                print("By continuing, you agree to the Unicode License:")
-                print("  https://www.unicode.org/license.txt\n")
-                fetch_open._notice = True
-            url = (
-                f"https://www.unicode.org/Public/"
-                f"{UNICODE_VERSION}/ucd/{path_rel_ucd}"
+def load_unicode_sources(data_dir):
+    data_dir.mkdir(parents=True, exist_ok=True)
+    base_url = f"https://www.unicode.org/Public/{unicode_public_directory}/"
+    source_paths = {}
+    for name, (relative_url, expected_hash) in unicode_sources.items():
+        path = data_dir / name
+        if path.exists():
+            if sha256_digest(path) != expected_hash:
+                raise ValueError(f"{path}: SHA-256 mismatch")
+        else:
+            url = base_url + relative_url
+            print(f"downloading {url}")
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=name + ".",
+                dir=str(data_dir),
             )
-            urllib.request.urlretrieve(url, localname)
-        except Exception as e:
-            sys.stderr.write(f"Error downloading {path_rel_ucd}: {e}\n")
-            sys.exit(1)
-
-    try:
-        return open(localname, encoding="utf-8")
-    except OSError as e:
-        sys.stderr.write(f"Cannot load {localname}: {e}\n")
-        sys.exit(1)
-
-
-def load_unicode_version() -> tuple[int, int, int]:
-    with fetch_open("ReadMe.txt") as readme:
-        m = re.search(r"for Version (\d+)\.(\d+)\.(\d+)", readme.read())
-        if not m:
-            sys.stderr.write("Could not determine Unicode version\n")
-            sys.exit(1)
-        return tuple(map(int, m.groups()))
+            os.close(descriptor)
+            temporary = Path(temporary_name)
+            try:
+                urllib.request.urlretrieve(url, temporary)
+                if sha256_digest(temporary) != expected_hash:
+                    raise ValueError(f"{name}: SHA-256 mismatch")
+                os.replace(temporary, path)
+            finally:
+                temporary.unlink(missing_ok=True)
+        source_paths[name] = path
+    return source_paths
 
 
-def load_property(path_rel_ucd: str, pattern: str, action: Callable[[int], None]):
-    with fetch_open(path_rel_ucd) as properties:
-        single = re.compile(rf"^([0-9A-F]+)\s*;\s*{pattern}\s+")
-        multiple = re.compile(rf"^([0-9A-F]+)\.\.([0-9A-F]+)\s*;\s*{pattern}\s+")
-        for line in properties.readlines():
-            raw = None
-            if m := single.match(line):
-                raw = (m.group(1), m.group(1))
-            elif m := multiple.match(line):
-                raw = (m.group(1), m.group(2))
-            else:
+# Unicode property loading
+
+def parse_range(field):
+    lower, separator, upper = field.partition("..")
+    lower = int(lower, 16)
+    return lower, int(upper, 16) if separator else lower
+
+
+def property_records(path):
+    with path.open(encoding="utf-8") as stream:
+        for line in stream:
+            body = line.partition("#")[0].strip()
+            if not body:
                 continue
-            lo, hi = int(raw[0], 16), int(raw[1], 16)
-            for cp in range(lo, hi + 1):
-                action(cp)
+            fields = tuple(field.strip() for field in body.split(";"))
+            lower, upper = parse_range(fields[0])
+            yield lower, upper, fields[1:]
 
 
-def to_sorted_ranges(it: Iterable[Codepoint]) -> list[tuple[Codepoint, Codepoint]]:
-    lst = sorted(it)
-    out: list[tuple[int, int]] = []
-    for cp in lst:
-        if out and out[-1][1] == cp - 1:
-            out[-1] = (out[-1][0], cp)
-        else:
-            out.append((cp, cp))
-    return out
-
-
-class EastAsianWidth(enum.IntEnum):
-    NARROW = 1
-    WIDE = 2
-    AMBIGUOUS = 3
-
-
-class CharWidthInTable(enum.IntEnum):
-    ZERO = 0
-    ONE = 1
-    TWO = 2
-    SPECIAL = 3
-
-
-class WidthState(enum.IntEnum):
-    ZERO = 0x10000
-    NARROW = 0x10001
-    WIDE = 0x10002
-    THREE = 0x10003
-
-    LINE_FEED = 0x0001
-    EMOJI_MODIFIER = 0x0002
-    REGIONAL_INDICATOR = 0x0003
-    EMOJI_PRESENTATION = 0x0005
-
-    VARIATION_SELECTOR_15 = 0x4000  # FE0E
-    VARIATION_SELECTOR_16 = 0x8000  # FE0F
-
-    def table_width(self) -> CharWidthInTable:
-        if self == WidthState.ZERO:
-            return CharWidthInTable.ZERO
-        if self == WidthState.NARROW:
-            return CharWidthInTable.ONE
-        if self == WidthState.WIDE:
-            return CharWidthInTable.TWO
-        return CharWidthInTable.SPECIAL
-
-    def width_alone(self) -> int:
-        if self in (
-            WidthState.ZERO,
-            WidthState.VARIATION_SELECTOR_15,
-            WidthState.VARIATION_SELECTOR_16,
-        ):
-            return 0
-        if self in (WidthState.WIDE, WidthState.EMOJI_MODIFIER, WidthState.EMOJI_PRESENTATION):
-            return 2
-        if self == WidthState.THREE:
-            return 3
-        return 1
-
-
-def load_eaw() -> list[EastAsianWidth]:
-    with fetch_open("EastAsianWidth.txt") as eaw:
-        single = re.compile(r"^([0-9A-F]+)\s*;\s*(\w+) +# ")
-        multiple = re.compile(r"^([0-9A-F]+)\.\.([0-9A-F]+)\s*;\s*(\w+) +# ")
-        codes = {
-            **{c: EastAsianWidth.NARROW for c in ["N", "Na", "H"]},
-            **{c: EastAsianWidth.WIDE for c in ["W", "F"]},
-            "A": EastAsianWidth.AMBIGUOUS,
-        }
-        out: list[EastAsianWidth] = []
-        cur = 0
-        for line in eaw.readlines():
-            raw = None
-            if m := single.match(line):
-                raw = (m.group(1), m.group(1), m.group(2))
-            elif m := multiple.match(line):
-                raw = (m.group(1), m.group(2), m.group(3))
-            else:
+# @missing lines set defaults for ranges the file body omits. Loaders apply
+# them first. Explicit records then override.
+def missing_records(path):
+    prefix = "# @missing:"
+    with path.open(encoding="utf-8") as stream:
+        for line in stream:
+            line = line.strip()
+            if not line.startswith(prefix):
                 continue
-            lo, hi, w = int(raw[0], 16), int(raw[1], 16), codes[raw[2]]
-            assert cur <= hi
-            while cur <= hi:
-                out.append(EastAsianWidth.NARROW if cur < lo else w)
-                cur += 1
-        while len(out) < NUM_CODEPOINTS:
-            out.append(EastAsianWidth.NARROW)
-
-    load_property("LineBreak.txt", "AI", lambda cp: operator.setitem(out, cp, EastAsianWidth.AMBIGUOUS))
-    load_property(
-        "extracted/DerivedGeneralCategory.txt",
-        r"(:?Lu|Ll|Lt|Lm|Lo|Sk)",
-        lambda cp: operator.setitem(out, cp, EastAsianWidth.NARROW)
-        if out[cp] == EastAsianWidth.AMBIGUOUS
-        else None,
-    )
-    out[0x0387] = EastAsianWidth.AMBIGUOUS
-
-    with fetch_open("UnicodeData.txt") as udata:
-        m = re.compile(r"([0-9A-Z]+);.*?;.*?;.*?;.*?;([0-9A-Z]+) 0338;")
-        for line in udata.readlines():
-            if mm := m.match(line):
-                composed = int(mm.group(1), 16)
-                decomposed = int(mm.group(2), 16)
-                if out[decomposed] == EastAsianWidth.AMBIGUOUS:
-                    out[composed] = EastAsianWidth.AMBIGUOUS
-
-    return out
-
-
-def load_zero_widths() -> list[bool]:
-    zw = [False] * NUM_CODEPOINTS
-    load_property(
-        "DerivedCoreProperties.txt",
-        r"(?:Default_Ignorable_Code_Point|Grapheme_Extend)",
-        lambda cp: operator.setitem(zw, cp, True),
-    )
-    load_property("HangulSyllableType.txt", r"(?:V|T)", lambda cp: operator.setitem(zw, cp, True))
-
-    for cp in [0x070F, 0x0605, 0x0890, 0x0891, 0x08E2]:
-        zw[cp] = True
-
-    prepend: set[int] = set()
-    load_property("auxiliary/GraphemeBreakProperty.txt", "Prepend", lambda cp: prepend.add(cp))
-    load_property("PropList.txt", "Prepended_Concatenation_Mark", lambda cp: prepend.discard(cp))
-    for cp in prepend:
-        zw[cp] = True
-
-    zw[0x115F] = False
-    zw[0x2D7F] = False
-    zw[0xA8FA] = True
-    zw[0x200D] = True
-    return zw
-
-
-def build_width_map() -> list[WidthState]:
-    eaw = load_eaw()
-    zw = load_zero_widths()
-    wm: list[WidthState] = []
-    for w, z in zip(eaw, zw):
-        wm.append(WidthState.ZERO if z else (WidthState.WIDE if w == EastAsianWidth.WIDE else WidthState.NARROW))
-
-    ri: list[int] = []
-    load_property("PropList.txt", "Regional_Indicator", lambda cp: ri.append(cp))
-
-    emod: list[int] = []
-    load_property("emoji/emoji-data.txt", "Emoji_Modifier", lambda cp: emod.append(cp))
-
-    epres: list[int] = []
-    load_property("emoji/emoji-data.txt", "Emoji_Presentation", lambda cp: epres.append(cp))
-
-    specials = [
-        ([0x000A], WidthState.LINE_FEED),
-        ([0x17A4], WidthState.WIDE),
-        ([0x17D8], WidthState.THREE),
-        ([0xFE0E], WidthState.VARIATION_SELECTOR_15),
-        ([0xFE0F], WidthState.VARIATION_SELECTOR_16),
-        (epres, WidthState.EMOJI_PRESENTATION),
-        (emod, WidthState.EMOJI_MODIFIER),
-        (ri, WidthState.REGIONAL_INDICATOR),
-    ]
-    for cps, w in specials:
-        for cp in cps:
-            wm[cp] = w
-    return wm
-
-
-def make_special_ranges(wm: list[WidthState]) -> list[tuple[tuple[int, int], WidthState]]:
-    out: list[tuple[tuple[int, int], WidthState]] = []
-    can_merge = False
-    for cp, w in enumerate(wm):
-        if w == WidthState.EMOJI_PRESENTATION:
-            can_merge = False
-        elif w.table_width() == CharWidthInTable.SPECIAL:
-            if can_merge and out[-1][1] == w:
-                out[-1] = ((out[-1][0][0], cp), w)
-            else:
-                out.append(((cp, cp), w))
-                can_merge = True
-    return out
-
-
-class Bucket:
-    def __init__(self):
-        self.entry_set: set[tuple[int, CharWidthInTable]] = set()
-        self.widths: list[CharWidthInTable] = []
-
-    def append(self, cp: Codepoint, width: CharWidthInTable):
-        self.entry_set.add((cp, width))
-        self.widths.append(width)
-
-    def try_extend(self, other: "Bucket") -> bool:
-        less, more = (self.widths, other.widths)
-        if len(less) > len(more):
-            less, more = more, less
-        if less != more[: len(less)]:
-            return False
-        self.entry_set |= other.entry_set
-        self.widths = more
-        return True
-
-    def entries(self) -> list[tuple[Codepoint, CharWidthInTable]]:
-        lst = list(self.entry_set)
-        lst.sort()
-        return lst
-
-    def width(self) -> CharWidthInTable | None:
-        if not self.widths:
-            return None
-        ref = self.widths[0]
-        for w in self.widths[1:]:
-            if w != ref:
-                return None
-        return ref
-
-
-def make_buckets(
-    entries: Iterable[tuple[int, CharWidthInTable]], low_bit: BitPos, cap_bit: BitPos
-) -> list[Bucket]:
-    num_bits = cap_bit - low_bit
-    assert num_bits > 0
-    buckets = [Bucket() for _ in range(0, 2**num_bits)]
-    mask = (1 << num_bits) - 1
-    for cp, width in entries:
-        buckets[(cp >> low_bit) & mask].append(cp, width)
-    return buckets
-
-
-class Table:
-    def __init__(
-        self,
-        name: str,
-        entry_groups: Iterable[Iterable[tuple[int, CharWidthInTable]]],
-        low_bit: BitPos,
-        cap_bit: BitPos,
-        offset_type: OffsetType,
-        align: int,
-        bytes_per_row: int | None = None,
-        starting_indexed: list[Bucket] | None = None,
-    ):
-        self.name = name
-        self.low_bit = low_bit
-        self.cap_bit = cap_bit
-        self.offset_type = offset_type
-        self.entries: list[int] = []
-        self.indexed: list[Bucket] = list(starting_indexed) if starting_indexed else []
-        self.align = align
-        self.bytes_per_row = bytes_per_row
-
-        buckets: list[Bucket] = []
-        for seq in entry_groups:
-            buckets.extend(make_buckets(seq, self.low_bit, self.cap_bit))
-
-        for b in buckets:
-            for i, exist in enumerate(self.indexed):
-                if exist.try_extend(b):
-                    self.entries.append(i)
-                    break
-            else:
-                self.entries.append(len(self.indexed))
-                self.indexed.append(b)
-
-        max_index = 1 << int(self.offset_type)
-        for idx in self.entries:
-            assert idx < max_index, f"{idx} <= {max_index}"
-
-    def indices_to_widths(self):
-        self.entries = [int(self.indexed[i].width()) for i in self.entries]  # type: ignore
-        del self.indexed
-
-    def buckets(self):
-        return self.indexed
-
-    def to_bytes(self) -> list[int]:
-        per_byte = 8 // int(self.offset_type)
-        out: list[int] = []
-        for i in range(0, len(self.entries), per_byte):
-            byte = 0
-            for j in range(0, per_byte):
-                if i + j < len(self.entries):
-                    byte |= self.entries[i + j] << (j * int(self.offset_type))
-            out.append(byte)
-        return out
-
-
-def make_tables(wm: list[WidthState]) -> list[Table]:
-    entries = enumerate([w.table_width() for w in wm])
-
-    root = Table("WIDTH_ROOT", [entries], TABLE_SPLITS[1], MAX_CODEPOINT_BITS, OffsetType.U8, 128)
-
-    middle = Table(
-        "WIDTH_MIDDLE",
-        map(lambda b: b.entries(), root.buckets()),
-        TABLE_SPLITS[0],
-        TABLE_SPLITS[1],
-        OffsetType.U8,
-        2 ** (TABLE_SPLITS[1] - TABLE_SPLITS[0]),
-        bytes_per_row=2 ** (TABLE_SPLITS[1] - TABLE_SPLITS[0]),
-    )
-
-    leaves = Table(
-        "WIDTH_LEAVES",
-        map(lambda b: b.entries(), middle.buckets()),
-        0,
-        TABLE_SPLITS[0],
-        OffsetType.U2,
-        2 ** (TABLE_SPLITS[0] - 2),
-        bytes_per_row=2 ** (TABLE_SPLITS[0] - 2),
-    )
-
-    leaves.indices_to_widths()
-    return [root, middle, leaves]
-
-
-def load_emoji_presentation_starts() -> list[Codepoint]:
-    with fetch_open("emoji/emoji-variation-sequences.txt") as seqs:
-        rx = re.compile(r"^([0-9A-F]+)\s+FE0F\s*;\s*emoji style")
-        out: list[int] = []
-        for line in seqs.readlines():
-            if m := rx.match(line):
-                out.append(int(m.group(1), 16))
-    return out
-
-
-def load_emoji_modifier_bases() -> list[Codepoint]:
-    out: list[int] = []
-    load_property("emoji/emoji-data.txt", "Emoji_Modifier_Base", lambda cp: out.append(cp))
-    out.sort()
-    return out
-
-
-def load_extended_pictographic() -> list[Codepoint]:
-    out: list[int] = []
-    load_property("emoji/emoji-data.txt", "Extended_Pictographic", lambda cp: out.append(cp))
-    out.sort()
-    return out
-
-
-def load_emoji_yes() -> list[Codepoint]:
-    out: list[int] = []
-    load_property("emoji/emoji-data.txt", "Emoji", lambda cp: out.append(cp))
-    out.sort()
-    return out
-
-
-def make_presentation_sequence_table(
-    cps: list[Codepoint], lsb: int = 10
-) -> tuple[list[tuple[int, int]], list[list[int]]]:
-    pref: Dict[int, set[int]] = defaultdict(set)
-    for cp in cps:
-        pref[cp >> lsb].add(cp & (2**lsb - 1))
-
-    msbs = sorted(pref.keys())
-    leaves: list[list[int]] = []
-    index_map: Dict[int, int] = {}
-
-    for i, msb in enumerate(msbs):
-        bits = [0] * (2 ** (lsb - 3))
-        for val in sorted(pref[msb]):
-            idx, bit = divmod(val, 8)
-            bits[idx] |= 1 << bit
-        leaves.append(bits)
-        index_map[msb] = i
-
-    indexes: list[tuple[int, int]] = []
-    uniq_leaves: list[list[int]] = []
-    leaf_ids: Dict[tuple[int, ...], int] = {}
-    for msb in msbs:
-        key = tuple(leaves[index_map[msb]])
-        if key in leaf_ids:
-            indexes.append((msb, leaf_ids[key]))
-        else:
-            leaf_ids[key] = len(uniq_leaves)
-            uniq_leaves.append(list(key))
-            indexes.append((msb, leaf_ids[key]))
-
-    return (indexes, uniq_leaves)
-
-
-def make_ranges_table(
-    cps: list[Codepoint],
-) -> tuple[list[tuple[int, int]], list[list[tuple[int, int]]]]:
-    pref: Dict[int, list[int]] = defaultdict(list)
-    for cp in cps:
-        pref[cp >> 8].append(cp & 0xFF)
-
-    msbs = sorted(pref.keys())
-    leaves: list[list[tuple[int, int]]] = []
-    index_map: Dict[int, int] = {}
-
-    for i, msb in enumerate(msbs):
-        arr = sorted(pref[msb])
-        leaf: list[tuple[int, int]] = []
-        for v in arr:
-            if leaf and leaf[-1][1] == v - 1:
-                leaf[-1] = (leaf[-1][0], v)
-            else:
-                leaf.append((v, v))
-        leaves.append(leaf)
-        index_map[msb] = i
-
-    indexes: list[tuple[int, int]] = []
-    uniq_leaves: list[list[tuple[int, int]]] = []
-    leaf_ids: Dict[tuple[tuple[int, int], ...], int] = {}
-
-    for msb in msbs:
-        key = tuple(leaves[index_map[msb]])
-        if key in leaf_ids:
-            indexes.append((msb, leaf_ids[key]))
-        else:
-            leaf_ids[key] = len(uniq_leaves)
-            uniq_leaves.append(list(key))
-            indexes.append((msb, leaf_ids[key]))
-
-    return (indexes, uniq_leaves)
-
-
-def emit_header(path: str, ver: tuple[int, int, int]):
-    with open(path, "w", newline="\n") as f:
-        f.write(
-            f"""/* Generated by unicode-width generator.
- *
- * Unicode {ver[0]}.{ver[1]}.{ver[2]} data.
- * For terminal width calculation.
- *
- * Copyright 2025 Dair Aidarkhanov
- * SPDX-License-Identifier: 0BSD
- */
-
-#ifndef UNICODE_WIDTH_H_
-#define UNICODE_WIDTH_H_
-
-#include <stddef.h> /* size_t */
-
-#if defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 199901L)
-  #include <stdint.h> /* uint_least32_t, uint_least16_t, uint_least8_t */
-#else
-  #include <limits.h>
-
-  /* Compile-time environment checks for C89. */
-
-  /* Enforce that char is at least 8 bits. */
-  #if CHAR_BIT < 8
-    #error "this implementation has `CHAR_BIT` < 8; unsupported"
-  #endif
-
-  /* uint_least8_t: choose the smallest type with at least 8 bits. */
-  #if UCHAR_MAX >= 0xFFu
-  typedef unsigned char  uint_least8_t;
-  #elif USHRT_MAX >= 0xFFu
-  typedef unsigned short uint_least8_t;
-  #elif UINT_MAX >= 0xFFu
-  typedef unsigned int   uint_least8_t;
-  #elif ULONG_MAX >= 0xFFul
-  typedef unsigned long  uint_least8_t;
-  #else
-  #error "no suitable type for `uint_least8_t` (need >= 8 bits)"
-  #endif
-
-  /* uint_least16_t: choose the smallest type with at least 16 bits. */
-  #if USHRT_MAX >= 0xFFFFu
-  typedef unsigned short uint_least16_t;
-  #elif UINT_MAX >= 0xFFFFu
-  typedef unsigned int   uint_least16_t;
-  #elif ULONG_MAX >= 0xFFFFul
-  typedef unsigned long  uint_least16_t;
-  #else
-  #error "no suitable type for `uint_least16_t` (need >= 16 bits)"
-  #endif
-
-  /* uint_least32_t: choose the smallest type with at least 32 bits. */
-  #if UINT_MAX >= 0xFFFFFFFFu
-  typedef unsigned int  uint_least32_t;
-  #elif ULONG_MAX >= 0xFFFFFFFFul
-  typedef unsigned long uint_least32_t;
-  #else
-  #error "no suitable type for `uint_least32_t` (need >= 32 bits)"
-  #endif
-
-  /* Enforce that unsigned long is at least 32 bits. */
-  #if ULONG_MAX < 0xFFFFFFFFul
-  #error "this implementation has unsigned long < 32 bits; unsupported"
-  #endif
-#endif
-
-#ifdef __cplusplus
-extern "C" {{
-#endif
-
-#define UNICODE_WIDTH_VERSION_MAJOR {ver[0]}
-#define UNICODE_WIDTH_VERSION_MINOR {ver[1]}
-#define UNICODE_WIDTH_VERSION_PATCH {ver[2]}
-
-typedef enum {{
-  WIDTH_STATE_DEFAULT     = 0,
-  WIDTH_STATE_AFTER_CR    = 1,
-  WIDTH_STATE_RI_ODD      = 2,
-  WIDTH_STATE_RI_EVEN     = 3,
-  WIDTH_STATE_ZWJ_PENDING = 4,
-  WIDTH_STATE_ZWJ_ACTIVE  = 5
-}} width_state_t;
-
-typedef struct {{
-  width_state_t  state;
-  uint_least32_t prev_codepoint;
-  uint_least8_t  last_base_width;
-  uint_least8_t  last_base_is_emoji_variation;
-}} unicode_width_state_t;
-
-void unicode_width_init(unicode_width_state_t *state);
-int  unicode_width_process(unicode_width_state_t *state, uint_least32_t codepoint);
-int  unicode_width_control_char(uint_least32_t codepoint);
-void unicode_width_reset(unicode_width_state_t *state);
-
-#ifdef __cplusplus
-}} /* extern "C" */
-#endif
-
-#endif /* UNICODE_WIDTH_H_ */
-"""
-        )
-
-
-def emit_source(
-    path: str,
-    ver: tuple[int, int, int],
-    tables: list[Table],
-    special_ranges: list[tuple[tuple[Codepoint, Codepoint], WidthState]],
-    epres_table: tuple[list[tuple[int, int]], list[list[int]]],
-    emod_table: tuple[list[tuple[int, int]], list[list[tuple[int, int]]]],
-    epicto_table: tuple[list[tuple[int, int]], list[list[tuple[int, int]]]],
-    emoji_yes_table: tuple[list[tuple[int, int]], list[list[tuple[int, int]]]],
+            fields = tuple(field.strip() for field in line[len(prefix) :].split(";"))
+            lower, upper = parse_range(fields[0])
+            yield lower, upper, fields[1:]
+
+
+def fill_range(values, lower, upper, value):
+    values[lower : upper + 1] = bytes([value]) * (upper - lower + 1)
+
+
+def load_grapheme_break_classes(path):
+    values = bytearray([grapheme_break_values["Other"]]) * unicode_limit
+    for lower, upper, (value,) in missing_records(path):
+        fill_range(values, lower, upper, grapheme_break_values[value])
+    for lower, upper, (value,) in property_records(path):
+        fill_range(values, lower, upper, grapheme_break_values[value])
+    return values
+
+
+def load_derived_core_properties(path):
+    default_ignorable = bytearray(unicode_limit)
+    grapheme_extend = bytearray(unicode_limit)
+    indic_conjunct_break = bytearray([indic_conjunct_break_values["None"]]) * unicode_limit
+
+    for lower, upper, fields in missing_records(path):
+        if fields[0] == "InCB":
+            fill_range(indic_conjunct_break, lower, upper, indic_conjunct_break_values[fields[1]])
+
+    for lower, upper, fields in property_records(path):
+        if fields == ("Default_Ignorable_Code_Point",):
+            fill_range(default_ignorable, lower, upper, 1)
+        elif fields == ("Grapheme_Extend",):
+            fill_range(grapheme_extend, lower, upper, 1)
+        elif fields[0] == "InCB":
+            fill_range(indic_conjunct_break, lower, upper, indic_conjunct_break_values[fields[1]])
+
+    return default_ignorable, grapheme_extend, indic_conjunct_break
+
+
+def load_east_asian_width(path):
+    widths = {
+        "N": width_narrow,
+        "Neutral": width_narrow,
+        "Na": width_narrow,
+        "H": width_narrow,
+        "A": width_ambiguous,
+        "W": width_wide,
+        "Wide": width_wide,
+        "F": width_wide,
+    }
+    values = bytearray([width_narrow]) * unicode_limit
+    for lower, upper, (value,) in missing_records(path):
+        fill_range(values, lower, upper, widths[value])
+    for lower, upper, (value,) in property_records(path):
+        fill_range(values, lower, upper, widths[value])
+    return values
+
+
+def load_extended_pictographic(path):
+    values = bytearray(unicode_limit)
+    for lower, upper, (property_name,) in property_records(path):
+        if property_name == "Extended_Pictographic":
+            fill_range(values, lower, upper, 1)
+    return values
+
+
+# Canonical decomposition and width contributions
+
+hangul_s_base = 0xAC00
+hangul_l_base = 0x1100
+hangul_v_base = 0x1161
+hangul_t_base = 0x11A7
+hangul_l_count = 19
+hangul_v_count = 21
+hangul_t_count = 28
+hangul_n_count = hangul_v_count * hangul_t_count
+hangul_s_count = hangul_l_count * hangul_n_count
+hangul_s_limit = hangul_s_base + hangul_s_count
+
+
+def parse_canonical_decomposition(fields):
+    field = fields[5]
+    if not field or field.startswith("<"):
+        return None
+    return tuple(int(item, 16) for item in field.split())
+
+
+def apply_unicode_data_range(
+    lower,
+    upper,
+    fields,
+    controls,
+    decompositions,
 ):
-    with open(path, "w", newline="\n") as f:
-        f.write(
-            f"""/* Generated by unicode-width generator.
+    decomposition = parse_canonical_decomposition(fields)
+    if fields[2] == "Cc":
+        fill_range(controls, lower, upper, 1)
+    if decomposition is not None:
+        for code_point in range(lower, upper + 1):
+            decompositions[code_point] = decomposition
+
+
+def load_unicode_data(path):
+    controls = bytearray(unicode_limit)
+    decompositions = {}
+    pending = None
+
+    with path.open(encoding="utf-8") as stream:
+        for line in stream:
+            fields = line.rstrip("\n").split(";")
+            code_point = int(fields[0], 16)
+            name = fields[1]
+            # UnicodeData packs some ranges as First/Last pairs. The First row
+            # supplies the fields for every code point through Last.
+            if name.endswith(", First>"):
+                pending = code_point, fields
+            elif name.endswith(", Last>"):
+                lower, range_fields = pending
+                apply_unicode_data_range(
+                    lower,
+                    code_point,
+                    range_fields,
+                    controls,
+                    decompositions,
+                )
+                pending = None
+            else:
+                apply_unicode_data_range(
+                    code_point,
+                    code_point,
+                    fields,
+                    controls,
+                    decompositions,
+                )
+
+    return controls, decompositions
+
+
+def hangul_decomposition(code_point):
+    syllable = code_point - hangul_s_base
+    parts = [
+        hangul_l_base + syllable // hangul_n_count,
+        hangul_v_base + (syllable % hangul_n_count) // hangul_t_count,
+    ]
+    if syllable % hangul_t_count:
+        parts.append(hangul_t_base + syllable % hangul_t_count)
+    return tuple(parts)
+
+
+def decompose_code_point(code_point, decompositions, decomposition_cache):
+    cached = decomposition_cache.get(code_point)
+    if cached is not None:
+        return cached
+    # Hangul syllables use the algorithmic decomposition from the standard.
+    # UnicodeData does not list those mappings.
+    if hangul_s_base <= code_point < hangul_s_limit:
+        parts = hangul_decomposition(code_point)
+    elif code_point in decompositions:
+        parts = decompositions[code_point]
+    else:
+        return (code_point,)
+    result = tuple(
+        item
+        for part in parts
+        for item in decompose_code_point(part, decompositions, decomposition_cache)
+    )
+    decomposition_cache[code_point] = result
+    return result
+
+
+def derive_width_contributions(
+    east_asian_width,
+    zero_width,
+    decompositions,
+):
+    width_contributions = bytearray(east_asian_width)
+    for code_point in range(unicode_limit):
+        if zero_width[code_point]:
+            width_contributions[code_point] = width_none
+
+    decomposition_cache = {}
+
+    # A code point with a canonical decomposition inherits the widest
+    # contribution among its parts, so width stays stable under normalization.
+    def contribution(code_point):
+        cached = decomposition_cache.get(code_point)
+        if cached is not None:
+            return cached
+        if hangul_s_base <= code_point < hangul_s_limit:
+            parts = hangul_decomposition(code_point)
+        elif code_point in decompositions:
+            parts = decompositions[code_point]
+        else:
+            return width_contributions[code_point]
+        value = max(contribution(part) for part in parts)
+        decomposition_cache[code_point] = value
+        return value
+
+    for code_point in decompositions:
+        width_contributions[code_point] = contribution(code_point)
+    for code_point in range(hangul_s_base, hangul_s_limit):
+        width_contributions[code_point] = contribution(code_point)
+    return width_contributions
+
+
+# Emoji presentation sequences
+
+ascii_keycap_starters = (0x23, 0x2A, *range(0x30, 0x3A))
+
+
+def presentation_sequence_records(path):
+    with path.open(encoding="utf-8") as stream:
+        for line in stream:
+            body = line.partition("#")[0].strip()
+            if not body:
+                continue
+            fields = tuple(field.strip() for field in body.split(";"))
+            yield fields[0], fields[1]
+
+
+def parse_code_point_sequence(field):
+    return tuple(int(item, 16) for item in field.split())
+
+
+def load_presentation_sequences(source_paths, decompositions):
+    presentation_sequences = {}
+    for sequence_field, _ in presentation_sequence_records(
+        source_paths["emoji-test.txt"]
+    ):
+        sequence = parse_code_point_sequence(sequence_field)
+        presentation_sequences[sequence] = action_emoji
+
+    actions = {
+        "text style": action_text,
+        "emoji style": action_emoji,
+    }
+    for sequence_field, style in presentation_sequence_records(
+        source_paths["emoji-variation-sequences.txt"]
+    ):
+        presentation_sequences[parse_code_point_sequence(sequence_field)] = (
+            actions[style]
+        )
+
+    decomposition_cache = {}
+    # A code point with a canonical decomposition inherits the singleton
+    # presentation action of its first component, so presentation stays stable
+    # under canonical normalization.
+    singleton_actions = {
+        sequence[0]: action
+        for sequence, action in presentation_sequences.items()
+        if len(sequence) == 1
+    }
+    for code_point in decompositions:
+        decomposition = decompose_code_point(
+            code_point,
+            decompositions,
+            decomposition_cache,
+        )
+        action = singleton_actions.get(decomposition[0])
+        if action is not None:
+            presentation_sequences[(code_point,)] = action
+    return presentation_sequences
+
+
+# Runtime properties
+
+# Property word layout: grapheme break in bits 0-3, Extended_Pictographic in
+# bit 4, Indic_Conjunct_Break in bits 5-6, width contribution in bits 7-8, and
+# the presentation-sequence starter flag in bit 9.
+def code_point_property_word(
+    grapheme_break,
+    extended_pictographic,
+    indic_conjunct_break,
+    controls,
+    width_contributions,
+    presentation_sequence_starters,
+    code_point,
+):
+    cluster_break = grapheme_break[code_point]
+    # Private grapheme class for Cc controls other than CR and LF. Breaks still
+    # follow GCB Control. Only these Cc points (plus CR/LF) become control events.
+    if controls[code_point] and cluster_break == grapheme_break_values["Control"]:
+        cluster_break = cc_grapheme_break
+    return (
+        cluster_break
+        | (extended_pictographic[code_point] * extended_pictographic_bit)
+        | (indic_conjunct_break[code_point] << indic_conjunct_break_shift)
+        | (width_contributions[code_point] << contribution_shift)
+        | (dfa_start_bit if code_point in presentation_sequence_starters else 0)
+    )
+
+
+def find_ascii_keycap_dfa_state(
+    states,
+    transitions,
+    root,
+    root_checkpoints,
+):
+    return dfa_transition(
+        root,
+        ascii_keycap_starters[0],
+        states,
+        transitions,
+        root,
+        root_checkpoints,
+    )
+
+
+# Binary encoding helpers
+
+def encode_uleb(value, output):
+    while value >= 0x80:
+        output.append((value & 0x7F) | 0x80)
+        value >>= 7
+    output.append(value)
+
+
+def decode_uleb(data, offset):
+    value = 0
+    shift = 0
+    while True:
+        byte = data[offset]
+        offset += 1
+        value |= (byte & 0x7F) << shift
+        if byte < 0x80:
+            return value, offset
+        shift += 7
+
+
+def append_16(output, value):
+    output.extend((value & 0xFF, (value >> 8) & 0xFF))
+
+
+def append_21(output, value):
+    output.extend(
+        (
+            value & 0xFF,
+            (value >> 8) & 0xFF,
+            (value >> 16) & 0x1F,
+        )
+    )
+
+
+def read_16(data, offset):
+    return data[offset] | (data[offset + 1] << 8)
+
+
+def read_21(data, offset):
+    return data[offset] | (data[offset + 1] << 8) | (data[offset + 2] << 16)
+
+
+# Code point property table
+
+def decode_property_runs(checkpoints, stream, run_count):
+    decoded = []
+    block_count = (run_count + property_run_block - 1) // property_run_block
+    for block in range(block_count):
+        checkpoint = block * checkpoint_bytes
+        start = read_21(checkpoints, checkpoint)
+        offset = read_16(checkpoints, checkpoint + encoded_u21_bytes)
+        count = min(
+            property_run_block,
+            run_count - block * property_run_block,
+        )
+        previous = start
+        for index in range(count):
+            packed, offset = decode_uleb(stream, offset)
+            run_start = previous + (packed >> property_dictionary_index_bits)
+            decoded.append(
+                (run_start, packed & property_dictionary_index_mask)
+            )
+            previous = run_start
+    return decoded
+
+
+# Store a run only where the property changes. Each run packs a dictionary
+# index in the low bits and a start delta in the rest. Pages narrow checkpoint
+# search. Each checkpoint starts one fixed-size block of runs.
+def encode_property_table(
+    grapheme_break,
+    extended_pictographic,
+    indic_conjunct_break,
+    controls,
+    width_contributions,
+    presentation_sequence_starters,
+):
+    values = array(
+        "H",
+        (
+            code_point_property_word(
+                grapheme_break,
+                extended_pictographic,
+                indic_conjunct_break,
+                controls,
+                width_contributions,
+                presentation_sequence_starters,
+                code_point,
+            )
+            for code_point in range(unicode_limit)
+        ),
+    )
+    dictionary = sorted(set(values))
+    if len(dictionary) > property_dictionary_index_mask + 1:
+        raise ValueError(
+            "code point property dictionary needs more than "
+            f"{property_dictionary_index_bits} bits"
+        )
+    dictionary_index = {value: index for index, value in enumerate(dictionary)}
+
+    runs = []
+    previous = None
+    for code_point, value in enumerate(values):
+        if value != previous:
+            runs.append((code_point, dictionary_index[value]))
+            previous = value
+
+    dictionary_bytes = bytearray()
+    for value in dictionary:
+        append_16(dictionary_bytes, value)
+
+    checkpoints = bytearray()
+    stream = bytearray()
+    for block in range(0, len(runs), property_run_block):
+        start = runs[block][0]
+        if len(stream) > 0xFFFF:
+            raise ValueError(
+                "code point stream offset no longer fits in 16 bits"
+            )
+        append_21(checkpoints, start)
+        append_16(checkpoints, len(stream))
+        previous = start
+        for index in range(block, min(block + property_run_block, len(runs))):
+            run_start, value = runs[index]
+            delta = 0 if index == block else run_start - previous
+            encode_uleb(
+                (delta << property_dictionary_index_bits) | value,
+                stream,
+            )
+            previous = run_start
+
+    pages = bytearray()
+    page_size = 1 << property_page_shift
+    checkpoint_count = len(checkpoints) // checkpoint_bytes
+    checkpoint = 0
+    for page_start in range(0, unicode_limit + page_size, page_size):
+        while (
+            checkpoint + 1 < checkpoint_count
+            and read_21(
+                checkpoints,
+                (checkpoint + 1) * checkpoint_bytes,
+            )
+            <= page_start
+        ):
+            checkpoint += 1
+        if checkpoint > 0xFF:
+            raise ValueError(
+                "code point page checkpoint no longer fits in one byte"
+            )
+        pages.append(checkpoint)
+
+    if decode_property_runs(checkpoints, stream, len(runs)) != runs:
+        raise ValueError("property table encoding failed")
+    return dictionary_bytes, checkpoints, stream, pages, len(runs)
+
+
+# Emoji presentation DFA
+
+# Build a trie, then merge states that share the same action and edges.
+# Walk in reverse so every child already has its final state number.
+def minimize_dfa(presentation_sequences):
+    trie = [{"action": action_none, "edges": {}}]
+    for sequence, action in sorted(presentation_sequences.items()):
+        state = 0
+        for code_point in sequence:
+            edges = trie[state]["edges"]
+            if code_point not in edges:
+                edges[code_point] = len(trie)
+                trie.append({"action": action_none, "edges": {}})
+            state = edges[code_point]
+        trie[state]["action"] = action
+
+    signatures = {}
+    old_to_new = {}
+    states = []
+    for old_state in range(len(trie) - 1, -1, -1):
+        signature = (
+            trie[old_state]["action"],
+            tuple(
+                (code_point, old_to_new[target])
+                for code_point, target in sorted(trie[old_state]["edges"].items())
+            ),
+        )
+        state = signatures.get(signature)
+        if state is None:
+            state = len(states)
+            signatures[signature] = state
+            states.append(signature)
+        old_to_new[old_state] = state
+
+    if len(states) > dfa_dead:
+        raise ValueError("DFA state no longer fits in one byte")
+    root = old_to_new[0]
+    return states, root
+
+
+def transition_ranges(edges):
+    ranges = []
+    current_range = None
+    for code_point, target in edges:
+        if (
+            current_range is not None
+            and code_point == current_range[1] + 1
+            and target == current_range[2]
+        ):
+            current_range[1] = code_point
+        else:
+            current_range = [code_point, code_point, target]
+            ranges.append(current_range)
+    return ranges
+
+
+def dfa_entry(states, state):
+    return read_16(states, state * encoded_u16_bytes)
+
+
+def dfa_offset(states, state):
+    return dfa_entry(states, state) & dfa_offset_mask
+
+
+def dfa_action(states, state):
+    return dfa_entry(states, state) >> dfa_action_shift
+
+
+def decode_dfa_ranges(states, transitions, state):
+    offset = dfa_offset(states, state)
+    end = dfa_offset(states, state + 1)
+    previous = -1
+    ranges = []
+    while offset < end:
+        gap, offset = decode_uleb(transitions, offset)
+        span, offset = decode_uleb(transitions, offset)
+        target = transitions[offset]
+        offset += 1
+        lower = previous + 1 + gap
+        upper = lower + span
+        ranges.append((lower, upper, target))
+        previous = upper
+    return ranges
+
+
+def dfa_transition(
+    state,
+    code_point,
+    states,
+    transitions,
+    root,
+    root_checkpoints,
+):
+    if state == dfa_dead:
+        return dfa_dead
+    end = dfa_offset(states, state + 1)
+    known_start = None
+
+    if state == root:
+        count = len(root_checkpoints) // checkpoint_bytes
+        if code_point < read_21(root_checkpoints, 0):
+            return dfa_dead
+        lower = 0
+        upper = count
+        while lower + 1 < upper:
+            middle = lower + (upper - lower) // 2
+            start = read_21(root_checkpoints, middle * checkpoint_bytes)
+            if start <= code_point:
+                lower = middle
+            else:
+                upper = middle
+        checkpoint = lower * checkpoint_bytes
+        known_start = read_21(root_checkpoints, checkpoint)
+        offset = read_16(
+            root_checkpoints,
+            checkpoint + encoded_u21_bytes,
+        )
+    else:
+        offset = dfa_offset(states, state)
+
+    previous = -1
+    first = True
+    while offset < end:
+        gap, offset = decode_uleb(transitions, offset)
+        span, offset = decode_uleb(transitions, offset)
+        target = transitions[offset]
+        offset += 1
+        if first and known_start is not None:
+            start = known_start
+        else:
+            start = previous + 1 + gap
+        first = False
+        stop = start + span
+        if code_point < start:
+            return dfa_dead
+        if code_point <= stop:
+            return target
+        previous = stop
+    return dfa_dead
+
+
+def decode_dfa_sequences(states, transitions, root):
+    decoded_sequences = {}
+
+    def walk(state, prefix):
+        action = dfa_action(states, state)
+        if action != action_none:
+            decoded_sequences[tuple(prefix)] = action
+        for lower, upper, target in decode_dfa_ranges(
+            states,
+            transitions,
+            state,
+        ):
+            for code_point in range(lower, upper + 1):
+                walk(target, prefix + [code_point])
+
+    walk(root, [])
+    return decoded_sequences
+
+
+# Each state entry holds a transition offset and the accepted action.
+# Transitions store gap, span, and a one-byte target for sorted ranges. Root
+# checkpoints index into the root state's transition list.
+def encode_dfa(presentation_sequences):
+    minimized, root = minimize_dfa(presentation_sequences)
+    entries = []
+    transitions = bytearray()
+    root_checkpoints = bytearray()
+
+    for state, (action, edges) in enumerate(minimized):
+        if len(transitions) >= dfa_offset_limit:
+            raise ValueError(
+                "DFA transition offset no longer fits in "
+                f"{dfa_offset_bits} bits"
+            )
+        entries.append(len(transitions) | (action << dfa_action_shift))
+        previous = -1
+        for index, (lower, upper, target) in enumerate(transition_ranges(edges)):
+            if state == root and index % dfa_root_block == 0:
+                append_21(root_checkpoints, lower)
+                append_16(root_checkpoints, len(transitions))
+            encode_uleb(lower - previous - 1, transitions)
+            encode_uleb(upper - lower, transitions)
+            transitions.append(target)
+            previous = upper
+
+    if len(transitions) >= dfa_offset_limit:
+        raise ValueError(
+            f"DFA transition stream no longer fits in {dfa_offset_bits} bits"
+        )
+    entries.append(len(transitions))
+    states = bytearray()
+    for entry in entries:
+        append_16(states, entry)
+
+    if decode_dfa_sequences(states, transitions, root) != presentation_sequences:
+        raise ValueError("DFA encoding failed")
+    return states, transitions, root_checkpoints, root
+
+
+# Source rendering
+
+def format_bytes(name, data):
+    lines = [f"static const unsigned char {name}[] = {{"]
+    for index in range(0, len(data), 16):
+        chunk = data[index : index + 16]
+        lines.append("    " + ", ".join(f"0x{value:02X}" for value in chunk) + ",")
+    lines.append("};")
+    return "\n".join(lines)
+
+
+def render_source(tables):
+    template = template_path.read_text(encoding="utf-8")
+    body = template.split("/* BEGIN GENERATED SOURCE */", 1)[1].lstrip()
+    replacements = {
+        "@property_dictionary@": format_bytes(
+            "uw_property_dictionary",
+            tables["property_dictionary"],
+        ),
+        "@property_checkpoints@": format_bytes(
+            "uw_property_checkpoints",
+            tables["property_checkpoints"],
+        ),
+        "@property_stream@": format_bytes(
+            "uw_property_stream",
+            tables["property_stream"],
+        ),
+        "@property_pages@": format_bytes(
+            "uw_property_pages",
+            tables["property_pages"],
+        ),
+        "@dfa_states@": format_bytes("uw_dfa_states", tables["dfa_states"]),
+        "@dfa_transitions@": format_bytes(
+            "uw_dfa_transitions",
+            tables["dfa_transitions"],
+        ),
+        "@dfa_root_checkpoints@": format_bytes(
+            "uw_dfa_root_checkpoints",
+            tables["dfa_root_checkpoints"],
+        ),
+        "@property_run_count@": str(tables["property_run_count"]),
+        "@property_run_block@": str(property_run_block),
+        "@property_dictionary_index_bits@": str(
+            property_dictionary_index_bits
+        ),
+        "@property_page_shift@": str(property_page_shift),
+        "@encoded_u16_bytes@": str(encoded_u16_bytes),
+        "@encoded_u21_bytes@": str(encoded_u21_bytes),
+        "@grapheme_break_mask@": f"0x{grapheme_break_mask:02X}",
+        "@extended_pictographic_bit@": f"0x{extended_pictographic_bit:02X}",
+        "@indic_conjunct_break_shift@": str(indic_conjunct_break_shift),
+        "@indic_conjunct_break_mask@": f"0x{indic_conjunct_break_mask:02X}",
+        "@contribution_shift@": str(contribution_shift),
+        "@contribution_mask@": f"0x{contribution_mask:02X}",
+        "@dfa_start_bit@": f"0x{dfa_start_bit:04X}",
+        "@emoji_stage_mask@": f"0x{emoji_stage_mask:02X}",
+        "@emoji_stage_none@": str(emoji_stage_none),
+        "@emoji_stage_extended_pictographic@": str(
+            emoji_stage_extended_pictographic
+        ),
+        "@emoji_stage_zwj@": str(emoji_stage_zwj),
+        "@property_checkpoint_count@": str(
+            len(tables["property_checkpoints"]) // checkpoint_bytes
+        ),
+        "@dfa_root@": str(tables["dfa_root"]),
+        "@dfa_offset_bits@": str(dfa_offset_bits),
+        "@ascii_limit@": f"0x{ascii_limit:02X}",
+        "@ascii_printable_first@": f"0x{ascii_printable_first:02X}",
+        "@ascii_printable_last@": f"0x{ascii_printable_last:02X}",
+        "@cr_code_point@": f"0x{cr_code_point:02X}",
+        "@lf_code_point@": f"0x{lf_code_point:02X}",
+        "@dfa_dead@": str(dfa_dead),
+        "@dfa_root_checkpoint_count@": str(
+            len(tables["dfa_root_checkpoints"]) // checkpoint_bytes
+        ),
+        "@ascii_keycap_dfa_state@": str(tables["ascii_keycap_dfa_state"]),
+    }
+    for marker, value in replacements.items():
+        body = body.replace(marker, value)
+    if "@" in body:
+        raise ValueError("unexpanded template marker")
+
+    return (
+        f"""/*
+ * Generated from Unicode {unicode_data_label} data.
  *
- * Unicode {ver[0]}.{ver[1]}.{ver[2]} data.
- * For terminal width calculation.
- *
- * Copyright 2025 Dair Aidarkhanov
- * SPDX-License-Identifier: 0BSD
+ * Copyright 2025-2026 Dair Aidarkhanov
+ * SPDX-License-Identifier: Zlib AND Unicode-3.0
  */
 
-#include "unicode_width.h"
-#include <assert.h>
-
-/* Base width tables (root/middle/leaves). */
 """
+        + body
+    )
+
+
+# Full Unicode model
+
+def load_unicode_model(source_paths):
+    grapheme_break = load_grapheme_break_classes(
+        source_paths["GraphemeBreakProperty.txt"]
+    )
+    default_ignorable, grapheme_extend, indic_conjunct_break = (
+        load_derived_core_properties(source_paths["DerivedCoreProperties.txt"])
+    )
+    zero_width = bytearray(
+        default_ignorable_value | grapheme_extend_value
+        for default_ignorable_value, grapheme_extend_value in zip(
+            default_ignorable,
+            grapheme_extend,
         )
-
-        # Base tables
-        for t in tables:
-            data = t.to_bytes()
-            if t.bytes_per_row is None:
-                f.write(f"static const uint_least8_t {t.name}[{len(data)}] = {{\n")
-                for i, b in enumerate(data):
-                    if i % 16 == 0:
-                        f.write("  ")
-                    f.write(f" 0x{b:02X},")
-                    if i % 16 == 15:
-                        f.write("\n")
-                if len(data) % 16 != 0:
-                    f.write("\n")
-                f.write("};\n\n")
-            else:
-                rows = len(data) // t.bytes_per_row
-                f.write(f"static const uint_least8_t {t.name}[{rows}][{t.bytes_per_row}] = {{\n")
-                for r in range(rows):
-                    f.write("  {")
-                    row = data[r * t.bytes_per_row : (r + 1) * t.bytes_per_row]
-                    for j, b in enumerate(row):
-                        if j % 16 == 0 and j > 0:
-                            f.write("\n   ")
-                        f.write(f" 0x{b:02X},")
-                    f.write("\n  },\n")
-                f.write("};\n\n")
-
-        # Emoji presentation bitmaps
-        ep_idx, ep_leaves = epres_table
-        if len(ep_leaves) > 0:
-            for i, leaf in enumerate(ep_leaves):
-                f.write(f"static const uint_least8_t EP_LEAF_{i}[128] = {{\n")
-                for j, b in enumerate(leaf):
-                    if j % 16 == 0:
-                        f.write("  ")
-                    f.write(f" 0x{b:02X},")
-                    if j % 16 == 15:
-                        f.write("\n")
-                if len(leaf) % 16 != 0:
-                    f.write("\n")
-                f.write("};\n")
-            f.write("\n")
-
-        def emit_range_leaves(prefix: str, leaves: list[list[tuple[int, int]]]):
-            if len(leaves) == 0:
-                return
-            for i, leaf in enumerate(leaves):
-                f.write(f"static const uint_least8_t {prefix}_LEAF_{i}_LO[{len(leaf)}] = {{")
-                for lo, hi in leaf:
-                    f.write(f" 0x{lo:02X},")
-                f.write(" };\n")
-                f.write(f"static const uint_least8_t {prefix}_LEAF_{i}_HI[{len(leaf)}] = {{")
-                for lo, hi in leaf:
-                    f.write(f" 0x{hi:02X},")
-                f.write(" };\n")
-            f.write("\n")
-
-        em_idx, em_leaves = emod_table
-        epi_idx, epi_leaves = epicto_table
-        ey_idx, ey_leaves = emoji_yes_table
-        emit_range_leaves("EMOD", em_leaves)
-        emit_range_leaves("EPICTO", epi_leaves)
-        emit_range_leaves("EYES", ey_leaves)
-
-        # is_emoji_presentation_start
-        if len(ep_idx) == 0:
-            f.write("static int is_emoji_presentation_start(uint_least32_t cp) {(void)cp; return 0;}\n\n")
-        else:
-            f.write("static int is_emoji_presentation_start(uint_least32_t cp) {\n")
-            f.write("  switch (cp >> 10) {\n")
-            for msb, lid in ep_idx:
-                f.write(f"    case 0x{msb:X}: {{\n")
-                f.write("      uint_least16_t bottom = (uint_least16_t)(cp & 0x3FF);\n")
-                f.write(f"      return (EP_LEAF_{lid}[bottom >> 3] >> (bottom & 7)) & 1;\n")
-                f.write("    }\n")
-            f.write("    default: return 0;\n")
-            f.write("  }\n")
-            f.write("}\n\n")
-
-        # Range table helpers
-        def emit_range_fn(name: str, idx: list[tuple[int, int]], leaves: list[list[tuple[int, int]]], pfx: str):
-            if len(idx) == 0:
-                f.write(f"static int {name}(uint_least32_t cp) {{ (void)cp; return 0; }}\n\n")
-                return
-            f.write(f"static int {name}(uint_least32_t cp) {{\n")
-            f.write("  switch (cp >> 8) {\n")
-            for msb, lid in idx:
-                n = len(leaves[lid])
-                f.write(f"    case 0x{msb:X}: {{\n")
-                f.write("      uint_least8_t bottom = (uint_least8_t)(cp & 0xFF);\n")
-                if n == 0:
-                    f.write("      return 0;\n")
-                else:
-                    f.write("      int lo = 0;\n")
-                    f.write(f"      int hi = {n - 1};\n")
-                    f.write("      while (lo <= hi) {\n")
-                    f.write("        int mid = (lo + hi) / 2;\n")
-                    f.write(f"        if (bottom < {pfx}_LEAF_{lid}_LO[mid]) hi = mid - 1;\n")
-                    f.write(f"        else if (bottom > {pfx}_LEAF_{lid}_HI[mid]) lo = mid + 1;\n")
-                    f.write("        else return 1;\n")
-                    f.write("      }\n")
-                    f.write("      return 0;\n")
-                f.write("    }\n")
-            f.write("    default: return 0;\n")
-            f.write("  }\n")
-            f.write("}\n\n")
-
-        emit_range_fn("is_emoji_modifier_base", em_idx, em_leaves, "EMOD")
-        emit_range_fn("is_extended_pictographic", epi_idx, epi_leaves, "EPICTO")
-        emit_range_fn("is_emoji", ey_idx, ey_leaves, "EYES")
-
-        # Base width lookup with classification
-        f.write("""typedef enum {
-  WC_DEFAULT = 0,
-  WC_LINE_FEED,
-  WC_EMOJI_MODIFIER,
-  WC_REGIONAL_INDICATOR,
-  WC_EMOJI_PRESENTATION,
-  WC_VS15,
-  WC_VS16
-} width_class_t;\n\n""")
-
-        f.write(
-            f"""static uint_least8_t table_leaf_index(uint_least32_t cp) {{
-  uint_least8_t t1;
-  uint_least8_t t2;
-  t1 = WIDTH_ROOT[cp >> {TABLE_SPLITS[1]}];
-  t2 = WIDTH_MIDDLE[t1][(cp >> {TABLE_SPLITS[0]}) & 0x{(2 ** (TABLE_SPLITS[1] - TABLE_SPLITS[0]) - 1):X}];
-  return t2;
-}}
-
-static void lookup_char(uint_least32_t cp, int *width_out, width_class_t *class_out) {{
-  uint_least8_t leaf;
-  uint_least8_t packed;
-  uint_least8_t w;
-
-  leaf = table_leaf_index(cp);
-  packed = WIDTH_LEAVES[leaf][(cp >> 2) & 0x{(2 ** (TABLE_SPLITS[0] - 2) - 1):X}];
-  w = (uint_least8_t)((packed >> (2 * (cp & 3))) & 0x3);
-
-  if (w < 3) {{
-    *width_out = (int)w;
-    *class_out = WC_DEFAULT;
-    return;
-  }}
-
-  switch (cp) {{
-"""
-        )
-        for (lo, hi), ws in special_ranges:
-            f.write(f"    case 0x{lo:X}:")
-            if hi != lo:
-                for cpv in range(lo + 1, hi + 1):
-                    f.write(f"\n    case 0x{cpv:X}:")
-            if ws == WidthState.LINE_FEED:
-                f.write(" *class_out = WC_LINE_FEED; *width_out = 0; break;\n")
-            elif ws == WidthState.EMOJI_MODIFIER:
-                f.write(" *class_out = WC_EMOJI_MODIFIER; *width_out = 2; break;\n")
-            elif ws == WidthState.REGIONAL_INDICATOR:
-                f.write(" *class_out = WC_REGIONAL_INDICATOR; *width_out = 1; break;\n")
-            elif ws == WidthState.EMOJI_PRESENTATION:
-                f.write(" *class_out = WC_EMOJI_PRESENTATION; *width_out = 2; break;\n")
-            elif ws == WidthState.VARIATION_SELECTOR_15:
-                f.write(" *class_out = WC_VS15; *width_out = 0; break;\n")
-            elif ws == WidthState.VARIATION_SELECTOR_16:
-                f.write(" *class_out = WC_VS16; *width_out = 0; break;\n")
-            else:
-                f.write(f" *class_out = WC_DEFAULT; *width_out = {ws.width_alone()}; break;\n")
-        f.write(
-            """    default:
-      *class_out = WC_EMOJI_PRESENTATION;
-      *width_out = 2;
-      break;
-  }
-}
-"""
-        )
-
-        # State machine
-        f.write(
-            """
-void unicode_width_init(unicode_width_state_t *state) {
-  assert(state != NULL);
-  state->state = WIDTH_STATE_DEFAULT;
-  state->prev_codepoint = 0;
-  state->last_base_width = 0;
-  state->last_base_is_emoji_variation = 0;
-}
-
-static int is_control_char(uint_least32_t cp) {
-  if (cp < 0x20u) return 1; /* includes CR/LF */
-  if (cp == 0x7Fu) return 1;
-  if (cp >= 0x80u && cp <= 0x9Fu) return 1;
-  return 0;
-}
-
-static int qualifies_zwj_partner(uint_least32_t cp) {
-  if (is_emoji_presentation_start(cp)) return 1;
-  if (is_extended_pictographic(cp) || is_emoji(cp)) return 1;
-  if (cp >= 0x1F1E6u && cp <= 0x1F1FFu) return 1;
-  if (cp == 0x23u || cp == 0x2Au || (cp >= (uint_least32_t)'0' && cp <= (uint_least32_t)'9')) return 1;
-  if (is_emoji_modifier_base(cp)) return 1;
-  return 0;
-}
-
-int unicode_width_process(unicode_width_state_t *state, uint_least32_t cp) {
-  int base_width = 0;
-  width_class_t wc = WC_DEFAULT;
-
-  assert(state != NULL);
-
-  /* Controls */
-  if (is_control_char(cp)) {
-    if (cp == 0x0Au) { /* LF */
-      state->state = WIDTH_STATE_DEFAULT;
-      state->prev_codepoint = cp;
-      state->last_base_width = 0;
-      state->last_base_is_emoji_variation = 0;
-      return 0;
+    )
+    east_asian_width = load_east_asian_width(
+        source_paths["DerivedEastAsianWidth.txt"]
+    )
+    controls, decompositions = load_unicode_data(source_paths["UnicodeData.txt"])
+    extended_pictographic = load_extended_pictographic(
+        source_paths["emoji-data.txt"]
+    )
+    width_contributions = derive_width_contributions(
+        east_asian_width,
+        zero_width,
+        decompositions,
+    )
+    presentation_sequences = load_presentation_sequences(
+        source_paths,
+        decompositions,
+    )
+    presentation_sequence_starters = {
+        sequence[0] for sequence in presentation_sequences
     }
-    if (cp == 0x0Du) { /* CR */
-      state->state = WIDTH_STATE_AFTER_CR;
-      state->prev_codepoint = cp;
-      state->last_base_width = 0;
-      state->last_base_is_emoji_variation = 0;
-      return 0;
+    return {
+        "grapheme_break": grapheme_break,
+        "extended_pictographic": extended_pictographic,
+        "indic_conjunct_break": indic_conjunct_break,
+        "controls": controls,
+        "width_contributions": width_contributions,
+        "presentation_sequence_starters": presentation_sequence_starters,
+        "presentation_sequences": presentation_sequences,
     }
-    state->prev_codepoint = cp;
-    state->last_base_width = 0;
-    state->last_base_is_emoji_variation = 0;
-    return -1;
-  }
 
-  /* CRLF */
-  if (state->state == WIDTH_STATE_AFTER_CR) {
-    if (cp == 0x0Au) {
-      state->state = WIDTH_STATE_DEFAULT;
-      state->prev_codepoint = cp;
-      state->last_base_width = 0;
-      state->last_base_is_emoji_variation = 0;
-      return 0;
-    } else {
-      state->state = WIDTH_STATE_DEFAULT;
+
+# Generation
+
+def build_tables(source_paths):
+    unicode_model = load_unicode_model(source_paths)
+    dictionary, checkpoints, stream, pages, run_count = encode_property_table(
+        unicode_model["grapheme_break"],
+        unicode_model["extended_pictographic"],
+        unicode_model["indic_conjunct_break"],
+        unicode_model["controls"],
+        unicode_model["width_contributions"],
+        unicode_model["presentation_sequence_starters"],
+    )
+    states, transitions, root_checkpoints, root = encode_dfa(
+        unicode_model["presentation_sequences"]
+    )
+    ascii_keycap_state = find_ascii_keycap_dfa_state(
+        states,
+        transitions,
+        root,
+        root_checkpoints,
+    )
+    return {
+        "property_dictionary": dictionary,
+        "property_checkpoints": checkpoints,
+        "property_stream": stream,
+        "property_pages": pages,
+        "property_run_count": run_count,
+        "dfa_states": states,
+        "dfa_transitions": transitions,
+        "dfa_root_checkpoints": root_checkpoints,
+        "dfa_root": root,
+        "ascii_keycap_dfa_state": ascii_keycap_state,
     }
-  }
-
-  /* Inside ZWJ cluster */
-  if (state->state == WIDTH_STATE_ZWJ_ACTIVE) {
-    if (cp == 0xFE0Fu || cp == 0xFE0Eu) {
-      state->state = WIDTH_STATE_DEFAULT;
-      state->prev_codepoint = cp;
-      return 0;
-    } else if (cp == 0x200Du) {
-      state->state = WIDTH_STATE_ZWJ_PENDING;
-      state->prev_codepoint = cp;
-      return 0;
-    } else {
-      state->state = WIDTH_STATE_DEFAULT;
-    }
-  }
-
-  /* VS adjustments (outside ZWJ-active) */
-  if (cp == 0xFE0Fu) {
-    int adjust = 0;
-    if (state->last_base_is_emoji_variation) {
-      if (state->last_base_width == 1u) adjust = +1;
-    }
-    state->prev_codepoint = cp;
-    state->last_base_width = 0;
-    state->last_base_is_emoji_variation = 0;
-    return adjust;
-  }
-  if (cp == 0xFE0Eu) {
-    int adjust = 0;
-    if (state->last_base_is_emoji_variation) {
-      if (state->last_base_width == 2u) adjust = -1;
-    }
-    state->prev_codepoint = cp;
-    state->last_base_width = 0;
-    state->last_base_is_emoji_variation = 0;
-    return adjust;
-  }
-
-  /* ZWJ starts pending */
-  if (cp == 0x200Du) {
-    state->state = WIDTH_STATE_ZWJ_PENDING;
-    state->prev_codepoint = cp;
-    return 0;
-  }
-
-  /* If ZWJ pending, only next qualifying cp joins */
-  if (state->state == WIDTH_STATE_ZWJ_PENDING) {
-    if (qualifies_zwj_partner(cp)) {
-      state->state = WIDTH_STATE_ZWJ_ACTIVE;
-      state->prev_codepoint = cp;
-      state->last_base_width = 0;
-      state->last_base_is_emoji_variation = 0;
-      return 0;
-    } else {
-      state->state = WIDTH_STATE_DEFAULT;
-    }
-  }
-
-  /* Skin tone modifiers after emoji-capable base => zero width */
-  if (cp >= 0x1F3FBu && cp <= 0x1F3FFu) {
-    if (state->last_base_is_emoji_variation) {
-      state->prev_codepoint = cp;
-      return 0;
-    }
-  }
-
-  lookup_char(cp, &base_width, &wc);
-
-  /* Regional Indicator parity */
-  if (wc == WC_REGIONAL_INDICATOR) {
-    if (state->state == WIDTH_STATE_RI_ODD) {
-      state->state = WIDTH_STATE_RI_EVEN;
-    } else {
-      state->state = WIDTH_STATE_RI_ODD;
-    }
-  } else {
-    if (state->state == WIDTH_STATE_RI_EVEN || state->state == WIDTH_STATE_RI_ODD) {
-      state->state = WIDTH_STATE_DEFAULT;
-    }
-  }
-
-  /* Track if this base can vary with VS */
-  {
-    int can_vary = 0;
-    if (wc == WC_EMOJI_PRESENTATION || is_emoji_presentation_start(cp)) {
-      can_vary = 1;
-    }
-    {
-      int ret = base_width;
-      state->last_base_width = (uint_least8_t)((ret <= 0) ? 0 : ((ret > 2) ? 2 : ret));
-      state->last_base_is_emoji_variation = (uint_least8_t)(can_vary ? 1 : 0);
-      state->prev_codepoint = cp;
-      return ret;
-    }
-  }
-}
-"""
-        )
-
-        f.write(
-            """
-int unicode_width_control_char(uint_least32_t codepoint) {
-  if (codepoint < 0x20u && codepoint != 0x0Au && codepoint != 0x0Du) return 2;
-  if (codepoint == 0x7Fu) return 2;
-  if (codepoint >= 0x80u && codepoint <= 0x9Fu) return 4;
-  return -1;
-}
-
-void unicode_width_reset(unicode_width_state_t *state) {
-  unicode_width_init(state);
-}
-"""
-        )
 
 
 def main():
-    print("Generating C code for Unicode width calculation...")
-    ver = load_unicode_version()
-    print(f"Unicode version: {ver[0]}.{ver[1]}.{ver[2]}")
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=unicode_data_directory,
+    )
+    parser.add_argument("--check", action="store_true")
+    arguments = parser.parse_args()
 
-    print("Loading width map...")
-    wm = build_width_map()
-
-    print("Building tables...")
-    tables = make_tables(wm)
-    special = make_special_ranges(wm)
-
-    print("Building property tables...")
-    epres = make_presentation_sequence_table(load_emoji_presentation_starts())
-    emod = make_ranges_table(load_emoji_modifier_bases())
-    epict = make_ranges_table(load_extended_pictographic())
-    eyes = make_ranges_table(load_emoji_yes())
-
-    print("Emitting header/source...")
-    emit_header(OUTPUT_HEADER, ver)
-    emit_source(OUTPUT_SOURCE, ver, tables, special, epres, emod, epict, eyes)
-
-    print(f"Done. Generated {OUTPUT_HEADER} and {OUTPUT_SOURCE}.")
+    source_paths = load_unicode_sources(arguments.data_dir.resolve())
+    tables = build_tables(source_paths)
+    source = render_source(tables)
+    if arguments.check:
+        if output_path.read_text(encoding="utf-8") != source:
+            raise ValueError(f"{output_path.name} is stale")
+    else:
+        with output_path.open("w", encoding="utf-8", newline="\n") as stream:
+            stream.write(source)
+        print(f"wrote {output_path.name}")
 
 
 if __name__ == "__main__":
