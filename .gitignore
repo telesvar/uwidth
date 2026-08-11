@@ -1,5 +1,9 @@
 .DS_Store
-*.txt
+.ruff_cache/
+.unicode-data/
+__pycache__/
+/unicode_width_test
+*.dylib
 *.exe
 *.o
-*.out
+*.so

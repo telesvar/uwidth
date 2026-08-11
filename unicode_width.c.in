@@ -1,0 +1,765 @@
+/*
+ * Copyright 2025-2026 Dair Aidarkhanov
+ * SPDX-License-Identifier: 0BSD
+ */
+
+/* BEGIN GENERATED SOURCE */
+
+#include "unicode_width.h"
+
+typedef uint_least32_t Uw_State_Word;
+
+typedef struct Uw_Internal_State {
+    Uw_State_Word words[2];
+} Uw_Internal_State;
+
+/*
+ * Code point properties are run-length encoded. Each run packs a dictionary
+ * index in the low bits and a start delta in the rest. Pages narrow the
+ * checkpoint search. Each checkpoint starts one fixed-size block of runs.
+ */
+
+@property_dictionary@
+
+@property_checkpoints@
+
+@property_stream@
+
+@property_pages@
+
+/*
+ * The presentation DFA matches exact emoji and variation sequences. Each state
+ * entry holds a transition offset and the accepted action. A trailing entry
+ * marks the end of the transition list. Transitions encode inclusive ranges as
+ * gap, span, and target. Root checkpoints speed the search from the start state.
+ */
+
+@dfa_states@
+
+@dfa_transitions@
+
+@dfa_root_checkpoints@
+
+#define UW_PROPERTY_RUN_COUNT @property_run_count@U
+#define UW_PROPERTY_CHECKPOINT_COUNT @property_checkpoint_count@U
+#define UW_PROPERTY_RUN_BLOCK @property_run_block@U
+#define UW_PROPERTY_DICTIONARY_INDEX_BITS @property_dictionary_index_bits@U
+#define UW_PROPERTY_DICTIONARY_INDEX_MASK \
+    ((1U << UW_PROPERTY_DICTIONARY_INDEX_BITS) - 1U)
+#define UW_PROPERTY_PAGE_SHIFT @property_page_shift@U
+#define UW_ENCODED_U16_BYTES @encoded_u16_bytes@U
+#define UW_ENCODED_U21_BYTES @encoded_u21_bytes@U
+#define UW_CHECKPOINT_BYTES (UW_ENCODED_U21_BYTES + UW_ENCODED_U16_BYTES)
+
+#define UW_DFA_ROOT @dfa_root@U
+#define UW_DFA_ROOT_CHECKPOINT_COUNT @dfa_root_checkpoint_count@U
+#define UW_DFA_OFFSET_BITS @dfa_offset_bits@U
+#define UW_DFA_ACTION_SHIFT UW_DFA_OFFSET_BITS
+#define UW_DFA_OFFSET_MASK ((1U << UW_DFA_OFFSET_BITS) - 1U)
+#define UW_DFA_DEAD @dfa_dead@U
+#define UW_ASCII_KEYCAP_DFA @ascii_keycap_dfa_state@U
+
+/*
+ * One property word holds grapheme break class, Extended_Pictographic, Indic
+ * conjunct break class, width contribution, and whether the point can start an
+ * exact presentation sequence.
+ */
+#define UW_GCB_MASK @grapheme_break_mask@U
+#define UW_EXTENDED_PICTOGRAPHIC @extended_pictographic_bit@U
+#define UW_INCB_SHIFT @indic_conjunct_break_shift@U
+#define UW_INCB_MASK @indic_conjunct_break_mask@U
+#define UW_CONTRIBUTION_SHIFT @contribution_shift@U
+#define UW_CONTRIBUTION_MASK @contribution_mask@U
+#define UW_DFA_START @dfa_start_bit@U
+#define UW_NON_SIMPLE_PROPERTY_MASK ( \
+    UW_GCB_MASK \
+    | UW_EXTENDED_PICTOGRAPHIC \
+    | (UW_INCB_MASK << UW_INCB_SHIFT) \
+    | UW_DFA_START \
+)
+
+#define UW_GCB_CR 1U
+#define UW_GCB_LF 2U
+#define UW_GCB_CONTROL 3U
+#define UW_GCB_EXTEND 4U
+#define UW_GCB_ZWJ 5U
+#define UW_GCB_RI 6U
+#define UW_GCB_PREPEND 7U
+#define UW_GCB_SPACING_MARK 8U
+#define UW_GCB_L 9U
+#define UW_GCB_V 10U
+#define UW_GCB_T 11U
+#define UW_GCB_LV 12U
+#define UW_GCB_LVT 13U
+/*
+ * Private grapheme class for Cc controls other than CR and LF. Breaks still
+ * follow GCB Control. These Cc points return -1. CR and LF return 0.
+ */
+#define UW_GCB_CC 14U
+
+#define UW_INCB_EXTEND 1U
+#define UW_INCB_LINKER 2U
+#define UW_INCB_CONSONANT 3U
+
+#define UW_WIDTH_NARROW 1U
+#define UW_WIDTH_AMBIGUOUS 2U
+#define UW_WIDTH_WIDE 3U
+
+#define UW_ACTION_NONE 0U
+#define UW_ACTION_EMOJI 1U
+
+#define UW_CODE_POINT_MAX 0x10FFFFU
+#define UW_SURROGATE_FIRST 0xD800U
+#define UW_SURROGATE_LAST 0xDFFFU
+#define UW_REPLACEMENT_CHARACTER 0xFFFDU
+
+#define UW_ASCII_LIMIT @ascii_limit@U
+#define UW_ASCII_PRINTABLE_FIRST @ascii_printable_first@U
+#define UW_ASCII_PRINTABLE_LAST @ascii_printable_last@U
+#define UW_CR_CODE_POINT @cr_code_point@U
+#define UW_LF_CODE_POINT @lf_code_point@U
+
+/*
+ * words[0] holds the last scalar, grapheme-break suffix, and cluster flags.
+ * words[1] holds the max width contribution, presentation DFA state, and latest
+ * accepted presentation action. A simple cluster has no boundary suffix. Its
+ * break properties are implied by the simple flag.
+ */
+#define UW_CODE_POINT_MASK 0x001FFFFFUL
+#define UW_PREVIOUS_GCB_SHIFT 21U
+#define UW_PREVIOUS_GCB_MASK UW_GCB_MASK
+#define UW_RI_PARITY 0x02000000UL
+#define UW_EMOJI_STAGE_SHIFT 26U
+#define UW_EMOJI_STAGE_MASK @emoji_stage_mask@U
+#define UW_EMOJI_STAGE_NONE @emoji_stage_none@U
+#define UW_EMOJI_STAGE_EXTENDED_PICTOGRAPHIC \
+    @emoji_stage_extended_pictographic@U
+#define UW_EMOJI_STAGE_ZWJ @emoji_stage_zwj@U
+#define UW_INCB_STAGE_SHIFT 28U
+#define UW_INCB_STAGE_MASK 0x03U
+#define UW_HAS_CLUSTER 0x40000000UL
+#define UW_SIMPLE_CLUSTER 0x80000000UL
+#define UW_SIMPLE_STATE (UW_HAS_CLUSTER | UW_SIMPLE_CLUSTER)
+
+#define UW_CLUSTER_WIDTH_SHIFT 1U
+#define UW_CLUSTER_WIDTH_MASK 0x03U
+#define UW_DFA_SHIFT 3U
+#define UW_DFA_MASK UW_DFA_DEAD
+#define UW_PRESENTATION_SHIFT 11U
+#define UW_PRESENTATION_MASK 0x03U
+
+static Uw_State_Word uw_read_16(const unsigned char *data)
+{
+    return (Uw_State_Word)data[0] | ((Uw_State_Word)data[1] << 8);
+}
+
+static Uw_State_Word uw_read_21(const unsigned char *data)
+{
+    return (
+        (Uw_State_Word)data[0]
+        | ((Uw_State_Word)data[1] << 8)
+        | ((Uw_State_Word)data[2] << 16)
+    ) & UW_CODE_POINT_MASK;
+}
+
+static Uw_State_Word uw_read_uleb(const unsigned char **cursor)
+{
+    Uw_State_Word value;
+    unsigned int shift;
+    unsigned int byte;
+
+    value = 0U;
+    shift = 0U;
+    do {
+        byte = (unsigned int)*(*cursor)++;
+        value |= (Uw_State_Word)(byte & 0x7FU) << shift;
+        shift += 7U;
+    } while ((byte & 0x80U) != 0U);
+    return value;
+}
+
+static int uw_is_ascii_keycap_starter(uint_least32_t code_point)
+{
+    return code_point == 0x23U
+        || code_point == 0x2AU
+        || (code_point >= 0x30U && code_point <= 0x39U);
+}
+
+/*
+ * ASCII uses fixed properties. Every other scalar does a page-bounded
+ * checkpoint search, then walks at most one block of property runs.
+ */
+static unsigned int uw_code_point_property(uint_least32_t code_point)
+{
+    unsigned int lower;
+    unsigned int upper;
+    unsigned int middle;
+    unsigned int page;
+    unsigned int block;
+    unsigned int count;
+    unsigned int index;
+    unsigned int dictionary_index;
+    const unsigned char *checkpoint;
+    const unsigned char *cursor;
+    Uw_State_Word start;
+    Uw_State_Word packed;
+
+    if (code_point < UW_ASCII_LIMIT) {
+        if (code_point >= UW_ASCII_PRINTABLE_FIRST
+            && code_point <= UW_ASCII_PRINTABLE_LAST) {
+            return (UW_WIDTH_NARROW << UW_CONTRIBUTION_SHIFT) | (
+                uw_is_ascii_keycap_starter(code_point)
+                    ? UW_DFA_START
+                    : 0U
+            );
+        }
+        if (code_point == UW_CR_CODE_POINT) {
+            return (UW_WIDTH_NARROW << UW_CONTRIBUTION_SHIFT) | UW_GCB_CR;
+        }
+        if (code_point == UW_LF_CODE_POINT) {
+            return (UW_WIDTH_NARROW << UW_CONTRIBUTION_SHIFT) | UW_GCB_LF;
+        }
+        return (UW_WIDTH_NARROW << UW_CONTRIBUTION_SHIFT) | UW_GCB_CC;
+    }
+
+    page = (unsigned int)(code_point >> UW_PROPERTY_PAGE_SHIFT);
+    lower = uw_property_pages[page];
+    upper = (unsigned int)uw_property_pages[page + 1U] + 1U;
+    if (upper > UW_PROPERTY_CHECKPOINT_COUNT) {
+        upper = UW_PROPERTY_CHECKPOINT_COUNT;
+    }
+    while (lower + 1U < upper) {
+        middle = lower + (upper - lower) / 2U;
+        checkpoint = uw_property_checkpoints + middle * UW_CHECKPOINT_BYTES;
+        if (uw_read_21(checkpoint) <= (Uw_State_Word)code_point) {
+            lower = middle;
+        } else {
+            upper = middle;
+        }
+    }
+
+    block = lower;
+    checkpoint = uw_property_checkpoints + block * UW_CHECKPOINT_BYTES;
+    start = uw_read_21(checkpoint);
+    cursor = uw_property_stream + uw_read_16(
+        checkpoint + UW_ENCODED_U21_BYTES
+    );
+    count = UW_PROPERTY_RUN_COUNT - block * UW_PROPERTY_RUN_BLOCK;
+    if (count > UW_PROPERTY_RUN_BLOCK) {
+        count = UW_PROPERTY_RUN_BLOCK;
+    }
+
+    dictionary_index = 0U;
+    for (index = 0U; index < count; ++index) {
+        packed = uw_read_uleb(&cursor);
+        start += packed >> UW_PROPERTY_DICTIONARY_INDEX_BITS;
+        if (start > (Uw_State_Word)code_point) {
+            break;
+        }
+        dictionary_index = (unsigned int)(
+            packed & UW_PROPERTY_DICTIONARY_INDEX_MASK
+        );
+    }
+    return (unsigned int)uw_read_16(
+        uw_property_dictionary + dictionary_index * UW_ENCODED_U16_BYTES
+    );
+}
+
+static Uw_State_Word uw_dfa_entry(unsigned int state)
+{
+    return uw_read_16(uw_dfa_states + state * UW_ENCODED_U16_BYTES);
+}
+
+static Uw_State_Word uw_dfa_offset(unsigned int state)
+{
+    return uw_dfa_entry(state) & UW_DFA_OFFSET_MASK;
+}
+
+static unsigned int uw_dfa_action(unsigned int state)
+{
+    return state == UW_DFA_DEAD
+        ? UW_ACTION_NONE
+        : (unsigned int)(uw_dfa_entry(state) >> UW_DFA_ACTION_SHIFT);
+}
+
+static unsigned int uw_dfa_transition(
+    unsigned int state,
+    uint_least32_t code_point
+)
+{
+    unsigned int lower;
+    unsigned int upper;
+    unsigned int middle;
+    int known_start;
+    int first;
+    const unsigned char *checkpoint;
+    const unsigned char *cursor;
+    const unsigned char *end;
+    Uw_State_Word start;
+    Uw_State_Word stop;
+    Uw_State_Word gap;
+    Uw_State_Word span;
+    unsigned int target;
+
+    if (state == UW_DFA_DEAD) {
+        return UW_DFA_DEAD;
+    }
+
+    end = uw_dfa_transitions + uw_dfa_offset(state + 1U);
+    known_start = 0;
+    start = 0U;
+    if (state == UW_DFA_ROOT) {
+        if ((Uw_State_Word)code_point < uw_read_21(uw_dfa_root_checkpoints)) {
+            return UW_DFA_DEAD;
+        }
+        lower = 0U;
+        upper = UW_DFA_ROOT_CHECKPOINT_COUNT;
+        while (lower + 1U < upper) {
+            middle = lower + (upper - lower) / 2U;
+            checkpoint = uw_dfa_root_checkpoints
+                + middle * UW_CHECKPOINT_BYTES;
+            if (uw_read_21(checkpoint) <= (Uw_State_Word)code_point) {
+                lower = middle;
+            } else {
+                upper = middle;
+            }
+        }
+        checkpoint = uw_dfa_root_checkpoints + lower * UW_CHECKPOINT_BYTES;
+        start = uw_read_21(checkpoint);
+        cursor = uw_dfa_transitions + uw_read_16(
+            checkpoint + UW_ENCODED_U21_BYTES
+        );
+        known_start = 1;
+    } else {
+        cursor = uw_dfa_transitions + uw_dfa_offset(state);
+    }
+
+    first = 1;
+    stop = 0U;
+    while (cursor < end) {
+        gap = uw_read_uleb(&cursor);
+        span = uw_read_uleb(&cursor);
+        target = (unsigned int)*cursor++;
+        if (!(first && known_start)) {
+            start = first ? gap : stop + 1U + gap;
+        }
+        first = 0;
+        stop = start + span;
+        if ((Uw_State_Word)code_point < start) {
+            return UW_DFA_DEAD;
+        }
+        if ((Uw_State_Word)code_point <= stop) {
+            return target;
+        }
+    }
+    return UW_DFA_DEAD;
+}
+
+static void uw_set_dfa_state(
+    Uw_Internal_State *state,
+    unsigned int dfa_state
+)
+{
+    state->words[1] = (
+        state->words[1] & ~((Uw_State_Word)UW_DFA_MASK << UW_DFA_SHIFT)
+    ) | ((Uw_State_Word)dfa_state << UW_DFA_SHIFT);
+}
+
+/*
+ * Keep the action from the latest accepting DFA prefix. A later non-accepting
+ * suffix in the same grapheme cluster does not clear that presentation choice.
+ */
+static void uw_latch_presentation(Uw_Internal_State *state, unsigned int action)
+{
+    if (action != UW_ACTION_NONE) {
+        state->words[1] = (
+            state->words[1]
+            & ~((Uw_State_Word)UW_PRESENTATION_MASK << UW_PRESENTATION_SHIFT)
+        ) | ((Uw_State_Word)action << UW_PRESENTATION_SHIFT);
+    }
+}
+
+static void uw_advance_dfa(
+    Uw_Internal_State *state,
+    uint_least32_t code_point
+)
+{
+    unsigned int current_dfa_state;
+    unsigned int next_dfa_state;
+
+    current_dfa_state = (unsigned int)(
+        (state->words[1] >> UW_DFA_SHIFT) & UW_DFA_MASK
+    );
+    if (current_dfa_state == UW_DFA_DEAD) {
+        return;
+    }
+    next_dfa_state = uw_dfa_transition(current_dfa_state, code_point);
+    uw_set_dfa_state(state, next_dfa_state);
+    uw_latch_presentation(state, uw_dfa_action(next_dfa_state));
+}
+
+/*
+ * Width contributions are ordered values. The cluster width is the maximum
+ * contribution seen so far.
+ */
+static void uw_accumulate_width(
+    Uw_Internal_State *state,
+    unsigned int code_point_property
+)
+{
+    unsigned int current_contribution;
+    unsigned int contribution;
+
+    current_contribution = (unsigned int)(
+        (state->words[1] >> UW_CLUSTER_WIDTH_SHIFT) & UW_CLUSTER_WIDTH_MASK
+    );
+    contribution = (code_point_property >> UW_CONTRIBUTION_SHIFT)
+        & UW_CONTRIBUTION_MASK;
+    if (contribution > current_contribution) {
+        state->words[1] = (
+            state->words[1]
+            & ~((Uw_State_Word)UW_CLUSTER_WIDTH_MASK << UW_CLUSTER_WIDTH_SHIFT)
+        ) | ((Uw_State_Word)contribution << UW_CLUSTER_WIDTH_SHIFT);
+    }
+}
+
+static int uw_is_boundary_control(unsigned int grapheme_break)
+{
+    return grapheme_break == UW_GCB_CONTROL
+        || grapheme_break == UW_GCB_CR
+        || grapheme_break == UW_GCB_LF
+        || grapheme_break == UW_GCB_CC;
+}
+
+static int uw_should_break(
+    const Uw_Internal_State *state,
+    unsigned int code_point_property
+)
+{
+    unsigned int previous_grapheme_break;
+    unsigned int current_grapheme_break;
+    unsigned int current_indic_conjunct_break;
+    unsigned int emoji_stage;
+    unsigned int indic_conjunct_stage;
+
+    previous_grapheme_break = (unsigned int)(
+        (state->words[0] >> UW_PREVIOUS_GCB_SHIFT) & UW_PREVIOUS_GCB_MASK
+    );
+    current_grapheme_break = code_point_property & UW_GCB_MASK;
+    current_indic_conjunct_break = (
+        code_point_property >> UW_INCB_SHIFT
+    ) & UW_INCB_MASK;
+    emoji_stage = (unsigned int)(
+        (state->words[0] >> UW_EMOJI_STAGE_SHIFT) & UW_EMOJI_STAGE_MASK
+    );
+    indic_conjunct_stage = (unsigned int)(
+        (state->words[0] >> UW_INCB_STAGE_SHIFT) & UW_INCB_STAGE_MASK
+    );
+
+    /* GB3-GB5: keep CRLF together, and isolate other controls. */
+    if (previous_grapheme_break == UW_GCB_CR
+        && current_grapheme_break == UW_GCB_LF) {
+        return 0;
+    }
+    if (uw_is_boundary_control(previous_grapheme_break)
+        || uw_is_boundary_control(current_grapheme_break)) {
+        return 1;
+    }
+
+    /* GB6-GB8: join conjoining Hangul jamo and syllables. */
+    if (previous_grapheme_break == UW_GCB_L
+        && (current_grapheme_break == UW_GCB_L
+            || current_grapheme_break == UW_GCB_V
+            || current_grapheme_break == UW_GCB_LV
+            || current_grapheme_break == UW_GCB_LVT)) {
+        return 0;
+    }
+    if ((previous_grapheme_break == UW_GCB_LV
+            || previous_grapheme_break == UW_GCB_V)
+        && (current_grapheme_break == UW_GCB_V
+            || current_grapheme_break == UW_GCB_T)) {
+        return 0;
+    }
+    if ((previous_grapheme_break == UW_GCB_LVT
+            || previous_grapheme_break == UW_GCB_T)
+        && current_grapheme_break == UW_GCB_T) {
+        return 0;
+    }
+
+    /*
+     * GB9 and GB9a attach Extend, ZWJ, and SpacingMark. GB9b lets Prepend join
+     * what follows.
+     */
+    if (current_grapheme_break == UW_GCB_EXTEND
+        || current_grapheme_break == UW_GCB_ZWJ) {
+        return 0;
+    }
+    if (current_grapheme_break == UW_GCB_SPACING_MARK) {
+        return 0;
+    }
+    if (previous_grapheme_break == UW_GCB_PREPEND) {
+        return 0;
+    }
+
+    /* GB9c: consonant after a linker (and any following extenders). */
+    if (current_indic_conjunct_break == UW_INCB_CONSONANT
+        && indic_conjunct_stage == 2U) {
+        return 0;
+    }
+
+    /* GB11: join ExtPict after ExtPict, optional Extend marks, then ZWJ. */
+    if ((code_point_property & UW_EXTENDED_PICTOGRAPHIC) != 0U
+        && emoji_stage == UW_EMOJI_STAGE_ZWJ) {
+        return 0;
+    }
+
+    /* GB12-GB13: pair regional indicators from the start of the run. */
+    if (previous_grapheme_break == UW_GCB_RI
+        && current_grapheme_break == UW_GCB_RI
+        && (state->words[0] & UW_RI_PARITY) != 0U) {
+        return 0;
+    }
+    return 1;
+}
+
+/*
+ * Update the cluster boundary suffix. RI parity is set after an odd-length RI
+ * run. Emoji stage tracks Extended_Pictographic Extend* and that sequence plus
+ * ZWJ. The Indic stage tracks a consonant and a later linker.
+ */
+static void uw_advance_boundary(
+    Uw_Internal_State *state,
+    uint_least32_t code_point,
+    unsigned int code_point_property
+)
+{
+    unsigned int grapheme_break;
+    unsigned int indic_conjunct_break;
+    unsigned int emoji_stage;
+    unsigned int indic_conjunct_stage;
+    Uw_State_Word ri_parity;
+
+    grapheme_break = code_point_property & UW_GCB_MASK;
+    indic_conjunct_break = (
+        code_point_property >> UW_INCB_SHIFT
+    ) & UW_INCB_MASK;
+    emoji_stage = (unsigned int)(
+        (state->words[0] >> UW_EMOJI_STAGE_SHIFT) & UW_EMOJI_STAGE_MASK
+    );
+    indic_conjunct_stage = (unsigned int)(
+        (state->words[0] >> UW_INCB_STAGE_SHIFT) & UW_INCB_STAGE_MASK
+    );
+
+    if (grapheme_break == UW_GCB_RI) {
+        ri_parity = (state->words[0] & UW_RI_PARITY) == 0U
+            ? UW_RI_PARITY
+            : 0U;
+    } else {
+        ri_parity = 0U;
+    }
+
+    if ((code_point_property & UW_EXTENDED_PICTOGRAPHIC) != 0U) {
+        emoji_stage = UW_EMOJI_STAGE_EXTENDED_PICTOGRAPHIC;
+    } else if (emoji_stage == UW_EMOJI_STAGE_EXTENDED_PICTOGRAPHIC
+        && grapheme_break == UW_GCB_EXTEND) {
+        emoji_stage = UW_EMOJI_STAGE_EXTENDED_PICTOGRAPHIC;
+    } else if (emoji_stage == UW_EMOJI_STAGE_EXTENDED_PICTOGRAPHIC
+        && grapheme_break == UW_GCB_ZWJ) {
+        emoji_stage = UW_EMOJI_STAGE_ZWJ;
+    } else {
+        emoji_stage = UW_EMOJI_STAGE_NONE;
+    }
+
+    if (indic_conjunct_break == UW_INCB_CONSONANT) {
+        indic_conjunct_stage = 1U;
+    } else if ((indic_conjunct_stage == 1U || indic_conjunct_stage == 2U)
+        && indic_conjunct_break == UW_INCB_LINKER) {
+        indic_conjunct_stage = 2U;
+    } else if (!((indic_conjunct_stage == 1U || indic_conjunct_stage == 2U)
+        && indic_conjunct_break == UW_INCB_EXTEND)) {
+        indic_conjunct_stage = 0U;
+    }
+
+    state->words[0] = UW_HAS_CLUSTER
+        | ((Uw_State_Word)code_point & UW_CODE_POINT_MASK)
+        | ((Uw_State_Word)grapheme_break << UW_PREVIOUS_GCB_SHIFT)
+        | ri_parity
+        | ((Uw_State_Word)emoji_stage << UW_EMOJI_STAGE_SHIFT)
+        | ((Uw_State_Word)indic_conjunct_stage << UW_INCB_STAGE_SHIFT);
+}
+
+static void uw_start_cluster(
+    Uw_Internal_State *state,
+    uint_least32_t code_point,
+    unsigned int code_point_property
+)
+{
+    unsigned int dfa_state;
+
+    dfa_state = (code_point_property & UW_DFA_START) != 0U
+        ? uw_dfa_transition(UW_DFA_ROOT, code_point)
+        : UW_DFA_DEAD;
+    state->words[0] = 0U;
+    state->words[1] = (Uw_State_Word)dfa_state << UW_DFA_SHIFT;
+    uw_accumulate_width(state, code_point_property);
+    uw_latch_presentation(state, uw_dfa_action(dfa_state));
+    uw_advance_boundary(state, code_point, code_point_property);
+}
+
+static void uw_start_simple_cluster(
+    Uw_Internal_State *state,
+    unsigned int code_point_property
+)
+{
+    unsigned int contribution;
+
+    contribution = (code_point_property >> UW_CONTRIBUTION_SHIFT)
+        & UW_CONTRIBUTION_MASK;
+    state->words[0] = UW_SIMPLE_STATE;
+    state->words[1] = ((Uw_State_Word)contribution << UW_CLUSTER_WIDTH_SHIFT)
+        | ((Uw_State_Word)UW_DFA_DEAD << UW_DFA_SHIFT);
+}
+
+static void uw_add_to_cluster(
+    Uw_Internal_State *state,
+    uint_least32_t code_point,
+    unsigned int code_point_property
+)
+{
+    uw_accumulate_width(state, code_point_property);
+    uw_advance_dfa(state, code_point);
+    uw_advance_boundary(state, code_point, code_point_property);
+}
+
+static unsigned int uw_resolve_width(unsigned int contribution)
+{
+    if (contribution == UW_WIDTH_WIDE) {
+        return 2U;
+    }
+    return contribution != 0U ? 1U : 0U;
+}
+
+static unsigned int uw_current_width(const Uw_Internal_State *state)
+{
+    unsigned int presentation_action;
+    unsigned int contribution;
+
+    presentation_action = (unsigned int)(
+        (state->words[1] >> UW_PRESENTATION_SHIFT) & UW_PRESENTATION_MASK
+    );
+    if (presentation_action == UW_ACTION_EMOJI) {
+        return 2U;
+    }
+    contribution = (unsigned int)(
+        (state->words[1] >> UW_CLUSTER_WIDTH_SHIFT)
+        & UW_CLUSTER_WIDTH_MASK
+    );
+    return uw_resolve_width(contribution);
+}
+
+static void uw_load_state(
+    const unicode_width_state_t *source,
+    Uw_Internal_State *destination
+)
+{
+    destination->words[0] = source->prev_codepoint;
+    destination->words[1] = (Uw_State_Word)source->state;
+}
+
+static void uw_store_state(
+    unicode_width_state_t *destination,
+    const Uw_Internal_State *source,
+    unsigned int width
+)
+{
+    destination->state = (width_state_t)source->words[1];
+    destination->prev_codepoint = source->words[0];
+    destination->last_base_width = (uint_least8_t)width;
+    destination->last_base_is_emoji_variation = 0U;
+}
+
+void unicode_width_init(unicode_width_state_t *state)
+{
+    state->state = WIDTH_STATE_DEFAULT;
+    state->prev_codepoint = 0U;
+    state->last_base_width = 0U;
+    state->last_base_is_emoji_variation = 0U;
+}
+
+int unicode_width_process(
+    unicode_width_state_t *state,
+    uint_least32_t codepoint
+)
+{
+    Uw_Internal_State internal_state;
+    unsigned int code_point_property;
+    unsigned int grapheme_break;
+    unsigned int old_width;
+    unsigned int new_width;
+    int same_cluster;
+
+    if (codepoint > UW_CODE_POINT_MAX
+        || (codepoint >= UW_SURROGATE_FIRST
+            && codepoint <= UW_SURROGATE_LAST)) {
+        codepoint = UW_REPLACEMENT_CHARACTER;
+    }
+    code_point_property = uw_code_point_property(codepoint);
+    grapheme_break = code_point_property & UW_GCB_MASK;
+    if (grapheme_break == UW_GCB_CC
+        || grapheme_break == UW_GCB_CR
+        || grapheme_break == UW_GCB_LF) {
+        unicode_width_init(state);
+        return grapheme_break == UW_GCB_CC ? -1 : 0;
+    }
+
+    uw_load_state(state, &internal_state);
+    old_width = state->last_base_width;
+    same_cluster = 0;
+
+    /*
+     * A property that is only a width contribution can use the simple state.
+     * Anything with break or presentation bits, or a pending Prepend, takes
+     * the full boundary path.
+     */
+    if ((code_point_property & UW_NON_SIMPLE_PROPERTY_MASK) == 0U) {
+        if ((internal_state.words[0] & UW_HAS_CLUSTER) == 0U
+            || (internal_state.words[0] & UW_SIMPLE_CLUSTER) != 0U
+            || ((internal_state.words[0] >> UW_PREVIOUS_GCB_SHIFT)
+                & UW_PREVIOUS_GCB_MASK) != UW_GCB_PREPEND) {
+            uw_start_simple_cluster(&internal_state, code_point_property);
+        } else {
+            uw_add_to_cluster(&internal_state, codepoint, code_point_property);
+            same_cluster = 1;
+        }
+    } else if ((internal_state.words[0] & UW_HAS_CLUSTER) == 0U) {
+        uw_start_cluster(&internal_state, codepoint, code_point_property);
+    } else if (!uw_should_break(&internal_state, code_point_property)) {
+        uw_add_to_cluster(&internal_state, codepoint, code_point_property);
+        same_cluster = 1;
+    } else {
+        uw_start_cluster(&internal_state, codepoint, code_point_property);
+    }
+
+    new_width = uw_current_width(&internal_state);
+    uw_store_state(state, &internal_state, new_width);
+    return (int)new_width - (same_cluster ? (int)old_width : 0);
+}
+
+int unicode_width_control_char(uint_least32_t codepoint)
+{
+    if (codepoint < 0x20U && codepoint != 0x0AU && codepoint != 0x0DU) {
+        return 2;
+    }
+    if (codepoint == 0x7FU) {
+        return 2;
+    }
+    if (codepoint >= 0x80U && codepoint <= 0x9FU) {
+        return 4;
+    }
+    return -1;
+}
+
+void unicode_width_reset(unicode_width_state_t *state)
+{
+    unicode_width_init(state);
+}
